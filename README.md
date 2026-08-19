@@ -1,2 +1,2 @@
 # RAPID
-An [Reliable Asynchronous Parallel Internet Downloader] - RAPID
+An [Reliable Asynchronous Parallel Internet Downloader]
