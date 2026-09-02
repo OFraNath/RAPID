@@ -1,5 +1,5 @@
 # RAPID
-A <b>Reliable Asynchronous Parallel Internet Downloader</b>
+<b>Reliable Asynchronous Parallel Internet Downloader</b>
 
 How to run on Windows:
 `python RAPID.pyw` or just double click the file.
