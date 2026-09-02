@@ -12,15 +12,14 @@ Dependencies:
     cannot fix — the script will tell you how to get it.
 
 Internationalization (i18n):
-    The program is built with English as the default/base language.
-    Additional languages are loaded from the "languages" folder next to
-    this script. Any file named "<code>.language" (e.g. "pt-br.language")
+    Languages are loaded from the "languages" folder next to this script.
+    Any file named "<code>.language" (e.g. "en.language", "pt-br.language")
     containing a flat JSON object of translation keys will be picked up
     automatically and offered in the language selector.
 
-    If a translation file is missing, or a key is missing from it, the
-    program silently falls back to the built-in English text — no file,
-    no translation, falls back to English.
+    English is not built-in — it is loaded from languages/en.language like
+    any other language. If a key is missing, fallback is languages/en.language,
+    then the key name itself.
 """
 
 from __future__ import annotations
@@ -269,78 +268,24 @@ WRITE_BUF_SIZE  = 4  * 1024 * 1024
 # i18n — translation loader
 # ─────────────────────────────────────────────────────────────────────────────
 
-_BUILTIN_EN = {
-    "window_title": "RAPID — Reliable Asynchronous Parallel Internet Downloader",
-    "language_label": "Language:",
-    "theme_label": "Theme:",
-
-    "source_frame": "Source",
-    "url_label": "URL:",
-    "verify_btn": "Verify",
-    "save_as_label": "Save as:",
-    "browse_btn": "Browse…",
-    "workers_label": "Workers:",
-    "info_default": "Size: —    Range: —    Type: —",
-    "info_format": "Size: {size}    Range: {range}    Type: {type}",
-    "range_yes": "yes",
-    "range_no": "no",
-
-    "download_btn": "▶ Download",
-    "cancel_btn": "■ Cancel",
-    "open_log_btn": "Open log",
-
-    "progress_frame": "Progress",
-    "status_ready": "Ready.",
-    "log_frame": "Log",
-
-    "app_title": "RAPID",
-    "warn_need_url_verify": "Enter a URL first.",
-    "warn_need_url": "Enter a URL.",
-    "confirm_close_title": "RAPID",
-    "confirm_close_msg": "A download is in progress. Quit anyway?",
-    "log_file_title": "Log file",
-
-    "error_checking_url": "✗ Error checking URL: {error}",
-    "verified_msg": "Verified: {url} -> {size}, range={range}",
-    "status_checking": "Checking URL…",
-    "cancel_requested": "Cancellation requested…",
-    "size_range_type_msg": "Size: {size} | Range: {range} | Type: {type}",
-    "error_create_file": "✗ Error creating file: {error}",
-    "starting_download": "Starting download: {file} | {chunks} chunk(s) × {mb} MB | {workers} workers",
-    "worker_finished_error": "Worker finished with error: {error}",
-    "cancelled_by_user": "✗ Download cancelled by user.",
-    "chunks_incomplete": "✗ {count} chunk(s) not completed: {list}",
-    "download_complete": "✓ Download complete! {file} — {size} in {elapsed}s ({speed} MB/s)",
-    "status_done": "Done.",
-    "status_interrupted": "Interrupted.",
-    "status_progress": "{done} / {total}  —  {pct}%",
-    "stats_line": "Speed: {speed} MB/s    Elapsed: {elapsed}s    ETA: {remaining}s",
-
-    "chunk_ok": "[W{worker_id}] chunk {chunk} OK ({size} MB)",
-    "chunk_timeout": "[W{worker_id}] chunk {chunk} timeout (attempt {attempt})",
-    "chunk_stream_interrupted": "[W{worker_id}] chunk {chunk} stream interrupted (attempt {attempt})",
-    "chunk_connection_error": "[W{worker_id}] chunk {chunk} connection: {error} (attempt {attempt})",
-    "chunk_http_error": "[W{worker_id}] chunk {chunk} HTTP {status} (attempt {attempt})",
-    "chunk_disk_error": "[W{worker_id}] chunk {chunk} disk error: {error}",
-    "chunk_failed": "[W{worker_id}] chunk {chunk} FAILED after {retries} attempts.",
-}
-
-
 class Translator:
     """
     Loads *.language files from LANGUAGES_DIR (flat JSON key -> string).
     Each file's code is its filename stem (e.g. "pt-br.language" -> "pt-br").
-    English ("en") is always available, built into the program, and is used
-    as the fallback for any missing file or missing key in any language.
+    English is now loaded from languages/en.language like any other language.
+    Fallback is DEFAULT_LANG catalog, then key name.
     """
 
     def __init__(self, languages_dir: Path, log: Optional[logging.Logger] = None):
         self.languages_dir = languages_dir
         self.log = log
-        self.catalogs: dict[str, dict[str, str]] = {"en": dict(_BUILTIN_EN)}
-        self.display_names: dict[str, str] = {"en": "English"}
+        self.catalogs: dict[str, dict[str, str]] = {}
+        self.display_names: dict[str, str] = {}
         self.current = DEFAULT_LANG
         self._discover()
+        if not self.catalogs:
+            self.catalogs[DEFAULT_LANG] = {}
+            self.display_names[DEFAULT_LANG] = "English"
 
     def _discover(self) -> None:
         if not self.languages_dir.is_dir():
@@ -359,23 +304,31 @@ class Translator:
                 continue
 
             display_name = str(data.get("_meta_name", code))
-            merged = dict(_BUILTIN_EN)
-            merged.update({k: v for k, v in data.items() if k != "_meta_name"})
-            self.catalogs[code] = merged
+            catalog = {k: str(v) for k, v in data.items() if k != "_meta_name"}
+            self.catalogs[code] = catalog
             self.display_names[code] = display_name
 
     def available(self) -> list[tuple[str, str]]:
         """Returns list of (code, display_name), English first, then alphabetical."""
-        codes = sorted(self.catalogs.keys(), key=lambda c: (c != "en", self.display_names[c]))
-        return [(c, self.display_names[c]) for c in codes]
+        codes = sorted(self.catalogs.keys(), key=lambda c: (c != "en", self.display_names.get(c, c)))
+        return [(c, self.display_names.get(c, c)) for c in codes]
 
     def set_language(self, code: str) -> None:
         code = code.lower()
-        self.current = code if code in self.catalogs else DEFAULT_LANG
+        if code in self.catalogs:
+            self.current = code
+        elif DEFAULT_LANG in self.catalogs:
+            self.current = DEFAULT_LANG
+        elif self.catalogs:
+            self.current = next(iter(self.catalogs))
+        else:
+            self.current = DEFAULT_LANG
 
     def t(self, key: str, **kwargs) -> str:
-        catalog = self.catalogs.get(self.current, _BUILTIN_EN)
-        template = catalog.get(key) or _BUILTIN_EN.get(key) or key
+        catalog = self.catalogs.get(self.current, {})
+        template = catalog.get(key)
+        if template is None:
+            template = self.catalogs.get(DEFAULT_LANG, {}).get(key, key)
         if kwargs:
             try:
                 return template.format(**kwargs)
@@ -750,7 +703,8 @@ class RapidGUI(tk.Tk):
 
         frm_lang = ttk.Frame(self)
         frm_lang.pack(fill="x", padx=6, pady=(6, 0))
-        ttk.Label(frm_lang, text=self.tr.t("language_label")).pack(side="left")
+        self.lbl_lang = ttk.Label(frm_lang, text=self.tr.t("language_label"))
+        self.lbl_lang.pack(side="left")
 
         self._lang_codes = self.tr.available()
         self.lang_var = tk.StringVar(value=dict(self._lang_codes).get(self.tr.current, "English"))
@@ -761,7 +715,8 @@ class RapidGUI(tk.Tk):
         lang_combo.pack(side="left", padx=(6, 0))
         lang_combo.bind("<<ComboboxSelected>>", self._on_language_change)
 
-        ttk.Label(frm_lang, text=self.tr.t("theme_label")).pack(side="left", padx=(18, 0))
+        self.lbl_theme = ttk.Label(frm_lang, text=self.tr.t("theme_label"))
+        self.lbl_theme.pack(side="left", padx=(18, 0))
 
         self._theme_codes = self.th.available()
         self.theme_var = tk.StringVar(value=dict(self._theme_codes).get(self.th.current, "Light"))
@@ -858,6 +813,8 @@ class RapidGUI(tk.Tk):
         """Updates all static widget texts after a language change (dynamic
         log/status text keeps whatever language it was generated in)."""
         self.title(self.tr.t("window_title"))
+        self.lbl_lang.configure(text=self.tr.t("language_label"))
+        self.lbl_theme.configure(text=self.tr.t("theme_label"))
         self.frm_top.configure(text=self.tr.t("source_frame"))
         self.lbl_url.configure(text=self.tr.t("url_label"))
         self.btn_verify.configure(text=self.tr.t("verify_btn"))

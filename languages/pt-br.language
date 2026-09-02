@@ -1,9 +1,8 @@
 {
     "_meta_name": "Português (Brasil)",
-
     "window_title": "RAPID — Reliable Asynchronous Parallel Internet Downloader",
     "language_label": "Idioma:",
-
+    "theme_label": "Tema:",
     "source_frame": "Origem",
     "url_label": "URL:",
     "verify_btn": "Verificar",
@@ -14,22 +13,18 @@
     "info_format": "Tamanho: {size}    Range: {range}    Tipo: {type}",
     "range_yes": "sim",
     "range_no": "não",
-
     "download_btn": "▶ Baixar",
     "cancel_btn": "■ Cancelar",
     "open_log_btn": "Abrir log",
-
     "progress_frame": "Progresso",
     "status_ready": "Pronto.",
     "log_frame": "Log",
-
     "app_title": "RAPID",
     "warn_need_url_verify": "Informe uma URL primeiro.",
     "warn_need_url": "Informe uma URL.",
     "confirm_close_title": "RAPID",
     "confirm_close_msg": "Um download está em andamento. Encerrar mesmo assim?",
     "log_file_title": "Arquivo de log",
-
     "error_checking_url": "✗ Erro ao verificar URL: {error}",
     "verified_msg": "Verificado: {url} -> {size}, range={range}",
     "status_checking": "Verificando URL…",
@@ -45,7 +40,6 @@
     "status_interrupted": "Interrompido.",
     "status_progress": "{done} / {total}  —  {pct}%",
     "stats_line": "Velocidade: {speed} MB/s    Tempo decorrido: {elapsed}s    Restante estimado: {remaining}s",
-
     "chunk_ok": "[W{worker_id}] pedaço {chunk} OK ({size} MB)",
     "chunk_timeout": "[W{worker_id}] pedaço {chunk} timeout (tentativa {attempt})",
     "chunk_stream_interrupted": "[W{worker_id}] pedaço {chunk} stream interrompido (tentativa {attempt})",
