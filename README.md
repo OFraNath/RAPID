@@ -1,4 +1,4 @@
 # RAPID
-An [Reliable Asynchronous Parallel Internet Downloader]
+A <b>Reliable Asynchronous Parallel Internet Downloader</b>
 
 Latest: `1.0.0`
