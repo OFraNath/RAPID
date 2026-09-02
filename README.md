@@ -1,7 +1,11 @@
 # RAPID
 A <b>Reliable Asynchronous Parallel Internet Downloader</b>
 
-Latest: `0.0.5`
+How to run on Windows
+`python RAPID.pyw` or just double click the file.
+
+How to run on Linux
+`python3 RAPID.pyw`
 
 ## ⚖️ License
 
