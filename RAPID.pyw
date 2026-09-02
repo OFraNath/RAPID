@@ -1245,6 +1245,24 @@ class RapidGUI(tk.Tk):
         self.option_add("*TCombobox*Listbox.selectBackground", c["accent_color"])
         self.option_add("*TCombobox*Listbox.selectForeground", c["input_background_color"])
 
+        # option_add only affects widgets created *after* it's called, so it never
+        # recolors the theme Combobox's own popdown Listbox once that Listbox already
+        # exists (it's created once, lazily, the first time the dropdown opens, then
+        # reused). That's why hover/keyboard preview updated the whole app but left
+        # the open theme dropdown itself stuck on its original colors — reconfigure
+        # it directly here so it re-themes live too.
+        theme_lb = getattr(self, "_theme_listbox", None) or self._get_theme_listbox()
+        if theme_lb is not None:
+            try:
+                theme_lb.configure(
+                    background=c["input_background_color"],
+                    foreground=c["input_text_color"],
+                    selectbackground=c["accent_color"],
+                    selectforeground=c["input_background_color"],
+                )
+            except Exception:
+                pass
+
         self.style.configure(
             "TProgressbar", background=c["accent_color"], troughcolor=c["button_background_color"],
             bordercolor=c["border_color"], darkcolor=c["accent_color"], lightcolor=c["accent_color"],
