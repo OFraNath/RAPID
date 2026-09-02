@@ -1,0 +1,56 @@
+{
+    "_meta_name": "Português (Brasil)",
+
+    "window_title": "RAPID — Reliable Asynchronous Parallel Internet Downloader",
+    "language_label": "Idioma:",
+
+    "source_frame": "Origem",
+    "url_label": "URL:",
+    "verify_btn": "Verificar",
+    "save_as_label": "Salvar como:",
+    "browse_btn": "Procurar…",
+    "workers_label": "Workers:",
+    "info_default": "Tamanho: —    Range: —    Tipo: —",
+    "info_format": "Tamanho: {size}    Range: {range}    Tipo: {type}",
+    "range_yes": "sim",
+    "range_no": "não",
+
+    "download_btn": "▶ Baixar",
+    "cancel_btn": "■ Cancelar",
+    "open_log_btn": "Abrir log",
+
+    "progress_frame": "Progresso",
+    "status_ready": "Pronto.",
+    "log_frame": "Log",
+
+    "app_title": "RAPID",
+    "warn_need_url_verify": "Informe uma URL primeiro.",
+    "warn_need_url": "Informe uma URL.",
+    "confirm_close_title": "RAPID",
+    "confirm_close_msg": "Um download está em andamento. Encerrar mesmo assim?",
+    "log_file_title": "Arquivo de log",
+
+    "error_checking_url": "✗ Erro ao verificar URL: {error}",
+    "verified_msg": "Verificado: {url} -> {size}, range={range}",
+    "status_checking": "Verificando URL…",
+    "cancel_requested": "Cancelamento solicitado…",
+    "size_range_type_msg": "Tamanho: {size} | Range: {range} | Tipo: {type}",
+    "error_create_file": "✗ Erro ao criar arquivo: {error}",
+    "starting_download": "Iniciando download: {file} | {chunks} pedaço(s) × {mb} MB | {workers} workers",
+    "worker_finished_error": "Worker terminou com erro: {error}",
+    "cancelled_by_user": "✗ Download cancelado pelo usuário.",
+    "chunks_incomplete": "✗ {count} pedaço(s) não concluído(s): {list}",
+    "download_complete": "✓ Download completo! {file} — {size} em {elapsed}s ({speed} MB/s)",
+    "status_done": "Concluído.",
+    "status_interrupted": "Interrompido.",
+    "status_progress": "{done} / {total}  —  {pct}%",
+    "stats_line": "Velocidade: {speed} MB/s    Tempo decorrido: {elapsed}s    Restante estimado: {remaining}s",
+
+    "chunk_ok": "[W{worker_id}] pedaço {chunk} OK ({size} MB)",
+    "chunk_timeout": "[W{worker_id}] pedaço {chunk} timeout (tentativa {attempt})",
+    "chunk_stream_interrupted": "[W{worker_id}] pedaço {chunk} stream interrompido (tentativa {attempt})",
+    "chunk_connection_error": "[W{worker_id}] pedaço {chunk} conexão: {error} (tentativa {attempt})",
+    "chunk_http_error": "[W{worker_id}] pedaço {chunk} HTTP {status} (tentativa {attempt})",
+    "chunk_disk_error": "[W{worker_id}] pedaço {chunk} erro de disco: {error}",
+    "chunk_failed": "[W{worker_id}] pedaço {chunk} FALHOU após {retries} tentativas."
+}

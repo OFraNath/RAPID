@@ -1,0 +1,56 @@
+{
+    "_meta_name": "English",
+
+    "window_title": "RAPID — Reliable Asynchronous Parallel Internet Downloader",
+    "language_label": "Language:",
+
+    "source_frame": "Source",
+    "url_label": "URL:",
+    "verify_btn": "Verify",
+    "save_as_label": "Save as:",
+    "browse_btn": "Browse…",
+    "workers_label": "Workers:",
+    "info_default": "Size: —    Range: —    Type: —",
+    "info_format": "Size: {size}    Range: {range}    Type: {type}",
+    "range_yes": "yes",
+    "range_no": "no",
+
+    "download_btn": "▶ Download",
+    "cancel_btn": "■ Cancel",
+    "open_log_btn": "Open log",
+
+    "progress_frame": "Progress",
+    "status_ready": "Ready.",
+    "log_frame": "Log",
+
+    "app_title": "RAPID",
+    "warn_need_url_verify": "Enter a URL first.",
+    "warn_need_url": "Enter a URL.",
+    "confirm_close_title": "RAPID",
+    "confirm_close_msg": "A download is in progress. Quit anyway?",
+    "log_file_title": "Log file",
+
+    "error_checking_url": "✗ Error checking URL: {error}",
+    "verified_msg": "Verified: {url} -> {size}, range={range}",
+    "status_checking": "Checking URL…",
+    "cancel_requested": "Cancellation requested…",
+    "size_range_type_msg": "Size: {size} | Range: {range} | Type: {type}",
+    "error_create_file": "✗ Error creating file: {error}",
+    "starting_download": "Starting download: {file} | {chunks} chunk(s) × {mb} MB | {workers} workers",
+    "worker_finished_error": "Worker finished with error: {error}",
+    "cancelled_by_user": "✗ Download cancelled by user.",
+    "chunks_incomplete": "✗ {count} chunk(s) not completed: {list}",
+    "download_complete": "✓ Download complete! {file} — {size} in {elapsed}s ({speed} MB/s)",
+    "status_done": "Done.",
+    "status_interrupted": "Interrupted.",
+    "status_progress": "{done} / {total}  —  {pct}%",
+    "stats_line": "Speed: {speed} MB/s    Elapsed: {elapsed}s    ETA: {remaining}s",
+
+    "chunk_ok": "[W{worker_id}] chunk {chunk} OK ({size} MB)",
+    "chunk_timeout": "[W{worker_id}] chunk {chunk} timeout (attempt {attempt})",
+    "chunk_stream_interrupted": "[W{worker_id}] chunk {chunk} stream interrupted (attempt {attempt})",
+    "chunk_connection_error": "[W{worker_id}] chunk {chunk} connection: {error} (attempt {attempt})",
+    "chunk_http_error": "[W{worker_id}] chunk {chunk} HTTP {status} (attempt {attempt})",
+    "chunk_disk_error": "[W{worker_id}] chunk {chunk} disk error: {error}",
+    "chunk_failed": "[W{worker_id}] chunk {chunk} FAILED after {retries} attempts."
+}
