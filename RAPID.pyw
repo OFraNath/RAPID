@@ -77,6 +77,18 @@ def setup_logging(debug: bool = False, clear: bool = False) -> logging.Logger:
 _EARLY_LOG = setup_logging(clear=True)
 
 
+class _GuiQueueHandler(logging.Handler):
+    def __init__(self, target_queue: "queue.Queue[str]"):
+        super().__init__()
+        self.target_queue = target_queue
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.target_queue.put(self.format(record))
+        except Exception:
+            pass
+
+
 def _install_crash_handlers(log: logging.Logger) -> None:
     orig_excepthook = sys.excepthook
 
@@ -717,21 +729,20 @@ def worker(
 
                 chunk.done = True
                 success = True
-                log_q.put(tr.t("chunk_ok", worker_id=f"{worker_id:02d}", chunk=chunk.index, size=f"{chunk.size/1e6:.1f}"))
-                log.debug(f"[W{worker_id:02d}] chunk {chunk.index} OK ({chunk.size/1e6:.1f} MB)")
+                log.info(tr.t("chunk_ok", worker_id=f"{worker_id:02d}", chunk=chunk.index, size=f"{chunk.size/1e6:.1f}"))
                 break
 
             except requests.exceptions.Timeout:
-                log_q.put(tr.t("chunk_timeout", worker_id=f"{worker_id:02d}", chunk=chunk.index, attempt=attempt))
+                log.warning(tr.t("chunk_timeout", worker_id=f"{worker_id:02d}", chunk=chunk.index, attempt=attempt))
             except requests.exceptions.ChunkedEncodingError:
-                log_q.put(tr.t("chunk_stream_interrupted", worker_id=f"{worker_id:02d}", chunk=chunk.index, attempt=attempt))
+                log.warning(tr.t("chunk_stream_interrupted", worker_id=f"{worker_id:02d}", chunk=chunk.index, attempt=attempt))
             except requests.exceptions.ConnectionError as e:
-                log_q.put(tr.t("chunk_connection_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, error=e, attempt=attempt))
+                log.warning(tr.t("chunk_connection_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, error=e, attempt=attempt))
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else "?"
-                log_q.put(tr.t("chunk_http_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, status=status, attempt=attempt))
+                log.warning(tr.t("chunk_http_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, status=status, attempt=attempt))
             except OSError as e:
-                log_q.put(tr.t("chunk_disk_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, error=e))
+                log.error(tr.t("chunk_disk_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, error=e))
                 chunk_q.task_done()
                 return
 
@@ -739,7 +750,7 @@ def worker(
                 _backoff(attempt)
 
         if not success:
-            log_q.put(tr.t("chunk_failed", worker_id=f"{worker_id:02d}", chunk=chunk.index, retries=MAX_RETRIES))
+            log.error(tr.t("chunk_failed", worker_id=f"{worker_id:02d}", chunk=chunk.index, retries=MAX_RETRIES))
 
         chunk_q.task_done()
 
@@ -762,10 +773,16 @@ class RapidGUI(tk.Tk):
 
         try:
             self.log = setup_logging(clear=True)
-            self.log.info("GUI initialized")
         except NameError:
             self.log = setup_logging(clear=True)
-            self.log.info("GUI initialized")
+
+        self.log_q: "queue.Queue[str]" = queue.Queue()
+        self._gui_log_handler = _GuiQueueHandler(self.log_q)
+        self._gui_log_handler.setFormatter(logging.Formatter("%(message)s"))
+        self._gui_log_handler.setLevel(logging.DEBUG)
+        self.log.addHandler(self._gui_log_handler)
+
+        self.log.info("GUI initialized")
         self.tr = Translator(LANGUAGES_DIR, self.log)
         self.th = ThemeManager(THEMES_DIR, self.log)
         self._load_preferences()
@@ -779,7 +796,6 @@ class RapidGUI(tk.Tk):
         self.geometry("640x560")
         self.resizable(False, False)
 
-        self.log_q: "queue.Queue[str]" = queue.Queue()
         self.stop_event = threading.Event()
         self.download_thread: Optional[threading.Thread] = None
         self.state: Optional[DownloadState] = None
@@ -797,10 +813,14 @@ class RapidGUI(tk.Tk):
         self._rgb_interval_ms = max(10, min(1000, self._rgb_interval_ms))
         self._rgb_step_deg = max(0.05, min(10.0, self._rgb_step_deg))
 
+        self._log_buffer: "list[str]" = []
+        self._fade_counter = 0
+
         self._build_ui()
         self._apply_theme()
         self.after(150, self._poll_log)
         self.after(200, self._poll_progress)
+        self.after(90, self._drain_log_buffer)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── UI ──
@@ -845,6 +865,11 @@ class RapidGUI(tk.Tk):
             theme_combo.bind(_seq, self._on_theme_key_preview, add="+")
         theme_combo.bind("<Escape>", self._on_theme_preview_revert, add="+")
         theme_combo.bind("<FocusOut>", self._on_theme_focus_out, add="+")
+
+        self.clock_var = tk.StringVar(value="")
+        self.lbl_clock = ttk.Label(frm_lang, textvariable=self.clock_var, style="Muted.TLabel")
+        self.lbl_clock.pack(side="right", padx=(6, 0))
+        self._update_clock()
 
         self.frm_top = ttk.LabelFrame(self, text=self.tr.t("source_frame"))
         self.frm_top.pack(fill="x", **pad)
@@ -912,6 +937,10 @@ class RapidGUI(tk.Tk):
         self.stats_var = tk.StringVar(value="")
         self.lbl_stats = ttk.Label(frm_stats, textvariable=self.stats_var, style="Muted.TLabel")
         self.lbl_stats.pack(anchor="w")
+
+    def _update_clock(self):
+        self.clock_var.set(time.strftime("%H:%M:%S"))
+        self.after(1000, self._update_clock)
 
     def _font_ok(self, name: str) -> bool:
         try:
@@ -1382,22 +1411,49 @@ class RapidGUI(tk.Tk):
     # ── Actions ──
 
     def _append_log(self, msg: str):
+        c = self.th.colors()
+        bg = c.get("log_background_color", "#000000")
+        fg = c.get("log_text_color", "#dddddd")
+
         self.log_text.configure(state="normal")
+        start_index = self.log_text.index("end-1c")
         self.log_text.insert("end", msg + "\n")
+        end_index = self.log_text.index("end-1c")
+
+        tag = f"fade_{self._fade_counter}"
+        self._fade_counter += 1
+        self.log_text.tag_add(tag, start_index, end_index)
+        self.log_text.tag_configure(tag, foreground=bg)
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+        self._fade_step(tag, self._hex_to_rgb(bg), self._hex_to_rgb(fg), 0, 12)
+
+    def _fade_step(self, tag, start_rgb, end_rgb, step, total):
+        t = step / total
+        cur = tuple(s + (e - s) * t for s, e in zip(start_rgb, end_rgb))
         try:
-            self.log.info(msg)
-        except Exception:
-            pass
+            self.log_text.tag_configure(tag, foreground=self._rgb_to_hex(cur))
+        except tk.TclError:
+            return
+        if step < total:
+            self.after(22, lambda: self._fade_step(tag, start_rgb, end_rgb, step + 1, total))
+
+    @staticmethod
+    def _hex_to_rgb(hexcolor: str):
+        hexcolor = hexcolor.lstrip("#")
+        return tuple(int(hexcolor[i:i + 2], 16) for i in (0, 2, 4))
+
+    @staticmethod
+    def _rgb_to_hex(rgb) -> str:
+        return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(v)))) for v in rgb)
 
     def _queue_log(self, msg: str, level: int = logging.INFO) -> None:
-        """Enqueue to GUI and write to file immediately — use instead of log_q.put()."""
+        """Log a message — it reaches the GUI automatically via the logger's GUI handler."""
         try:
             self.log.log(level, msg)
         except Exception:
             pass
-        self.log_q.put(msg)
 
     def _on_browse(self):
         path = filedialog.asksaveasfilename(initialfile=self.filename_var.get() or "download")
@@ -1414,7 +1470,7 @@ class RapidGUI(tk.Tk):
             try:
                 info = inspect_url(make_session(), url, self.log)
             except Exception as e:
-                self.log_q.put(self.tr.t("error_checking_url", error=e))
+                self.log.error(self.tr.t("error_checking_url", error=e))
                 return
             self.info = info
             if not self.filename_var.get():
@@ -1425,7 +1481,7 @@ class RapidGUI(tk.Tk):
                 range=self.tr.t("range_yes") if info.accepts_range else self.tr.t("range_no"),
                 type=info.content_type,
             ))
-            self.log_q.put(self.tr.t(
+            self.log.info(self.tr.t(
                 "verified_msg", url=url, size=human_size(info.total_bytes), range=info.accepts_range,
             ))
 
@@ -1458,7 +1514,7 @@ class RapidGUI(tk.Tk):
     def _on_cancel(self):
         if self.running:
             self.stop_event.set()
-            self.log_q.put(self.tr.t("cancel_requested"))
+            self.log.info(self.tr.t("cancel_requested"))
 
     def _on_close(self):
 
@@ -1514,12 +1570,12 @@ class RapidGUI(tk.Tk):
         try:
             info = inspect_url(session, url, self.log)
         except Exception as e:
-            self.log_q.put(self.tr.t("error_checking_url", error=e))
+            self.log.error(self.tr.t("error_checking_url", error=e))
             self._finish(success=False)
             return
 
         self.info = info
-        self.log_q.put(self.tr.t(
+        self.log.info(self.tr.t(
             "size_range_type_msg",
             size=human_size(info.total_bytes),
             range=self.tr.t("range_yes") if info.accepts_range else self.tr.t("range_no"),
@@ -1547,11 +1603,11 @@ class RapidGUI(tk.Tk):
                     f.seek(info.total_bytes - 1)
                     f.write(b"\x00")
         except OSError as e:
-            self.log_q.put(self.tr.t("error_create_file", error=e))
+            self.log.error(self.tr.t("error_create_file", error=e))
             self._finish(success=False)
             return
 
-        self.log_q.put(self.tr.t(
+        self.log.info(self.tr.t(
             "starting_download",
             file=file_name, chunks=len(chunks), mb=CHUNK_PART_SIZE // 1024 // 1024, workers=n_workers,
         ))
@@ -1572,22 +1628,22 @@ class RapidGUI(tk.Tk):
                 try:
                     f.result()
                 except Exception as e:
-                    self.log_q.put(self.tr.t("worker_finished_error", error=e))
+                    self.log.error(self.tr.t("worker_finished_error", error=e))
 
         if self.stop_event.is_set():
-            self.log_q.put(self.tr.t("cancelled_by_user"))
+            self.log.info(self.tr.t("cancelled_by_user"))
             self._finish(success=False)
             return
 
         failed = [c.index for c in self.state.chunks if not c.done]
         if failed:
-            self.log_q.put(self.tr.t("chunks_incomplete", count=len(failed), list=failed[:10]))
+            self.log.warning(self.tr.t("chunks_incomplete", count=len(failed), list=failed[:10]))
             self._finish(success=False)
             return
 
         elapsed = time.monotonic() - self.start_time
         avg = info.total_bytes / elapsed / 1e6 if elapsed > 0 else 0
-        self.log_q.put(self.tr.t(
+        self.log.info(self.tr.t(
             "download_complete",
             file=file_name, size=human_size(info.total_bytes), elapsed=f"{elapsed:.1f}", speed=f"{avg:.2f}",
         ))
@@ -1605,10 +1661,17 @@ class RapidGUI(tk.Tk):
         try:
             while True:
                 msg = self.log_q.get_nowait()
-                self._append_log(msg)
+                self._log_buffer.append(msg)
         except queue.Empty:
             pass
         self.after(150, self._poll_log)
+
+    def _drain_log_buffer(self):
+        if self._log_buffer:
+            msg = self._log_buffer.pop(0)
+            self._append_log(msg)
+        delay = 90 if len(self._log_buffer) < 5 else 20
+        self.after(delay, self._drain_log_buffer)
 
     def _poll_progress(self):
         if self.state is not None and self.info is not None and self.info.total_bytes > 0:
