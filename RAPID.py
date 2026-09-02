@@ -26,8 +26,10 @@ Internationalization (i18n):
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import subprocess
 import sys
+import os
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Self-installing dependencies
@@ -295,7 +297,6 @@ class Translator:
             pass
 
         # Also check common environment variables (useful on Linux/macOS).
-        import os
         for var in ("LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"):
             val = os.environ.get(var)
             if val:
@@ -757,7 +758,15 @@ class RapidGUI(tk.Tk):
         self.destroy()
 
     def _open_log(self):
-        messagebox.showinfo(self.tr.t("log_file_title"), str(LOG_FILE))
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(LOG_FILE)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(LOG_FILE)])
+            else:
+                subprocess.Popen(["xdg-open", str(LOG_FILE)])
+        except Exception as e:
+            messagebox.showinfo(self.tr.t("log_file_title"), f"{LOG_FILE}\n\n{e}")
 
     # ------------------------------------------------------- Download core --
 
