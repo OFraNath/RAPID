@@ -1,7 +1,7 @@
 # RAPID
 A <b>Reliable Asynchronous Parallel Internet Downloader</b>
 
-Latest: `0.0.4`
+Latest: `0.0.5`
 
 ## ⚖️ License
 
