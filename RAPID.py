@@ -696,7 +696,7 @@ class RapidGUI(tk.Tk):
         self.after(200, self._poll_progress)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ---------------------------------------------------------------- UI ----
+    # ── UI ──
 
     def _build_ui(self):
         pad = {"padx": 6, "pady": 4}
@@ -801,7 +801,7 @@ class RapidGUI(tk.Tk):
         except Exception:
             return False
 
-    # ------------------------------------------------------------ i18n ----
+    # ── i18n ──
 
     def _on_language_change(self, _event=None):
         name_to_code = {name: code for code, name in self._lang_codes}
@@ -831,7 +831,7 @@ class RapidGUI(tk.Tk):
         if self.info is None:
             self.info_var.set(self.tr.t("info_default"))
 
-    # ----------------------------------------------------------- Theming ----
+    # ── Theming ──
 
     def _on_theme_change(self, _event=None):
         name_to_code = {name: code for code, name in self._theme_codes}
@@ -910,7 +910,7 @@ class RapidGUI(tk.Tk):
             bg=c["log_background_color"], fg=c["log_text_color"], insertbackground=c["log_text_color"],
         )
 
-    # ------------------------------------------------------------ Actions ----
+    # ── Actions ──
 
     def _append_log(self, msg: str):
         self.log_text.configure(state="normal")
@@ -1031,7 +1031,7 @@ class RapidGUI(tk.Tk):
         except Exception as e:
             messagebox.showinfo(self.tr.t("log_file_title"), f"{LOG_FILE}\n\n{e}")
 
-    # ------------------------------------------------------- Download core --
+    # ── Download core ──
 
     def _run_download(self, url: str, file_name: str, n_workers: int):
         session = make_session()
@@ -1125,7 +1125,7 @@ class RapidGUI(tk.Tk):
         self.btn_cancel.configure(state="disabled")
         self.status_var.set(self.tr.t("status_done") if success else self.tr.t("status_interrupted"))
 
-    # ----------------------------------------------------------- Pollers ----
+    # ── Pollers ──
 
     def _poll_log(self):
         try:
