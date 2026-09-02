@@ -1,0 +1,23 @@
+{
+    "_meta_name": "RGB Cycle",
+
+    "background_color":        "#0a0a14",
+    "text_color":               "#e0e0ff",
+    "secondary_text_color":     "#7a7ab8",
+    "border_color":             "#2a2a4a",
+
+    "button_background_color":  "#1e1e3a",
+    "button_text_color":        "#e0e0ff",
+
+    "input_background_color":   "#141428",
+    "input_text_color":         "#e0e0ff",
+
+    "accent_color":             "#00e5ff",
+
+    "log_background_color":     "#050508",
+    "log_text_color":           "#00ffcc",
+
+    "_comment_cycle": "Slow and steady — edit these two values to change speed. Interval is ms per tick, step is degrees of hue per tick (360° = full rainbow). Example: 80ms + 0.5° ≈ 57s per cycle. Smaller interval or larger step = faster.",
+    "cycle_interval_ms": 80,
+    "cycle_step_deg": 3.5
+}

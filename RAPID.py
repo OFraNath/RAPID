@@ -5,6 +5,7 @@ Simple, functional Tkinter interface for the RAPID download engine.
 
 from __future__ import annotations
 
+import colorsys
 import configparser
 import importlib
 import importlib.util
@@ -23,7 +24,7 @@ LOG_FILE = BASE_DIR / "rapid.log"
 LANGUAGES_DIR = BASE_DIR / "languages"
 DEFAULT_LANG = "en"
 THEMES_DIR = BASE_DIR / "themes"
-DEFAULT_THEME = "light"
+DEFAULT_THEME = "dark"
 CONFIG_FILE = BASE_DIR / "config.cfg"
 
 
@@ -382,6 +383,10 @@ _BUILTIN_LIGHT = {
 THEME_KEYS = [k for k in _BUILTIN_LIGHT if k != "_meta_name"]
 
 
+
+CYCLE_KEYS = ["cycle_interval_ms", "cycle_step_deg"]
+
+
 class ThemeManager:
     """
     Loads *.theme files from THEMES_DIR (flat JSON key -> hex color string).
@@ -395,6 +400,8 @@ class ThemeManager:
         self.log = log
         self.catalogs: dict[str, dict[str, str]] = {"light": dict(_BUILTIN_LIGHT)}
         self.display_names: dict[str, str] = {"light": "Light"}
+
+        self.cycle_params: dict[str, dict[str, float]] = {}
         self.current = DEFAULT_THEME
         self._discover()
 
@@ -420,14 +427,26 @@ class ThemeManager:
             self.catalogs[code] = merged
             self.display_names[code] = display_name
 
+            cycle_cfg: dict[str, float] = {}
+            for ck in CYCLE_KEYS:
+                if ck in data:
+                    try:
+
+                        cycle_cfg[ck] = float(data[ck])
+                    except Exception:
+                        if self.log:
+                            self.log.warning(f"Invalid {ck} in theme '{code}': {data[ck]!r}")
+            if cycle_cfg:
+                self.cycle_params[code] = cycle_cfg
+
     def available(self) -> list[tuple[str, str]]:
         """Returns list of (code, display_name) ordered for preview:
 
-        Light is always first (default), then remaining themes sorted
-        by background luminance (bright → dark). This groups light
-        themes together and dark themes together, so arrow Up/Down
-        and hover preview feel like a smooth light-to-dark sweep
-        instead of random alphabetical jumps.
+        Light is always first (default), RGB Cycle always last (animated),
+        then remaining themes sorted by background luminance (bright → dark).
+        This groups light themes together and dark themes together, so
+        arrow Up/Down and hover preview feel like a smooth light-to-dark
+        sweep instead of random alphabetical jumps.
         """
         def _lum(code: str) -> float:
             hx = self.catalogs[code].get("background_color", "#808080").lstrip("#")
@@ -439,11 +458,15 @@ class ThemeManager:
             except Exception:
                 return 0.0
 
-        # Light pinned first; rest by luminance bright→dark
-        codes = sorted(
-            self.catalogs.keys(),
-            key=lambda c: (c != "light", -_lum(c)),
-        )
+
+        others = [c for c in self.catalogs.keys() if c not in ("light", "rgb")]
+        others_sorted = sorted(others, key=lambda c: -_lum(c))
+        codes: list[str] = []
+        if "light" in self.catalogs:
+            codes.append("light")
+        codes.extend(others_sorted)
+        if "rgb" in self.catalogs:
+            codes.append("rgb")
         return [(c, self.display_names[c]) for c in codes]
 
     def set_theme(self, code: str) -> None:
@@ -474,8 +497,8 @@ def load_app_config(log: Optional[logging.Logger] = None) -> dict[str, str]:
                     if val:
                         cfg[key] = val
             return cfg
-        # Fallback: support flat key=value file without section header (legacy)
-        # If file has no section, try reading as if it were under [Preferences]
+
+
         text = CONFIG_FILE.read_text(encoding="utf-8")
         if "=" in text and "[" not in text:
             parser2 = configparser.ConfigParser()
@@ -765,6 +788,16 @@ class RapidGUI(tk.Tk):
         self.start_time = 0.0
         self.running = False
 
+
+
+        self._rgb_hue: float = 200.0
+        self._rgb_job: Optional[str] = None
+        self._rgb_interval_ms: int = int(self.th.cycle_params.get("rgb", {}).get("cycle_interval_ms", 80))
+        self._rgb_step_deg: float = float(self.th.cycle_params.get("rgb", {}).get("cycle_step_deg", 0.5))
+
+        self._rgb_interval_ms = max(10, min(1000, self._rgb_interval_ms))
+        self._rgb_step_deg = max(0.05, min(10.0, self._rgb_step_deg))
+
         self._build_ui()
         self._apply_theme()
         self.after(150, self._poll_log)
@@ -804,8 +837,8 @@ class RapidGUI(tk.Tk):
         # ── theme live preview (arrow keys / mouse hover) ──
         self.theme_combo = theme_combo
         self._committed_theme = self.th.current
-        self._theme_listbox = None  # cached Listbox widget for hover preview
-        # schedule hook after dropdown posts
+        self._theme_listbox = None
+
         theme_combo.bind("<Button-1>", lambda _e: self.after(20, self._hook_theme_listbox), add="+")
         theme_combo.bind("<KeyPress>", self._on_theme_combo_keypress_hook, add="+")
         for _seq in ("<KeyRelease-Up>", "<KeyRelease-Down>", "<KeyRelease-Prior>",
@@ -893,7 +926,7 @@ class RapidGUI(tk.Tk):
     def _load_preferences(self) -> None:
         """Load saved theme/language from config.cfg. Falls back to autodetect/default."""
         cfg = load_app_config(self.log)
-        # Theme
+
         saved_theme = cfg.get("theme", "").strip().lower()
         if saved_theme:
             if saved_theme in self.th.catalogs:
@@ -901,7 +934,7 @@ class RapidGUI(tk.Tk):
                 self.log.info(f"Loaded theme from config.cfg: {saved_theme}")
             else:
                 self.log.warning(f"Saved theme '{saved_theme}' not found in {list(self.th.catalogs.keys())}, using default")
-        # Language
+
         saved_lang = cfg.get("language", "").strip().lower()
         if saved_lang:
             if saved_lang in self.tr.catalogs:
@@ -1003,18 +1036,18 @@ class RapidGUI(tk.Tk):
     def _hook_theme_listbox(self) -> None:
         lb = self._get_theme_listbox()
         if lb is None:
-            # retry shortly — popdown may not be created yet
+
             self.after(40, self._hook_theme_listbox)
             return
         lb_path = lb._w  # type: ignore
-        # avoid double-binding same Tcl path
+
         hooked = getattr(self, "_theme_lb_hooked_paths", set())
         first_time = lb_path not in hooked
         if first_time:
             try:
                 lb.bind("<Motion>", self._on_theme_listbox_hover, add="+")
             except Exception:
-                # fallback via Tcl bind if wrapper fails
+
                 try:
                     self.tk.call("bind", lb_path, "<Motion>", f"+{self._on_theme_listbox_hover}")
                 except Exception:
@@ -1022,18 +1055,18 @@ class RapidGUI(tk.Tk):
             hooked.add(lb_path)
             self._theme_lb_hooked_paths = hooked  # type: ignore
             self._theme_listbox = lb
-            # also watch popdown unmap to handle focus cleanup
+
             try:
                 pop_w = self._get_theme_popdown()
                 if pop_w is not None:
                     pop_w.bind("<Unmap>", self._on_theme_popdown_unmap, add="+")
             except Exception:
                 pass
-        # always (re)start polling active index while popdown is mapped (covers arrow keys + hover reliably)
+
         self._start_theme_preview_poll()
 
     def _on_theme_combo_keypress_hook(self, event=None) -> None:
-        # Hook listbox shortly after any key that may open the popdown
+
         if event is not None and event.keysym in ("Up", "Down", "Next", "Prior", "Home", "End", "F4", "Alt_L", "Alt_R"):
             self.after(20, self._hook_theme_listbox)
 
@@ -1052,7 +1085,7 @@ class RapidGUI(tk.Tk):
             self._preview_theme(code)
 
     def _on_theme_key_preview(self, _event=None) -> None:
-        # defer so Tk has updated listbox/var state
+
         self.after(10, self._do_theme_key_preview)
 
     def _do_theme_key_preview(self) -> None:
@@ -1082,14 +1115,14 @@ class RapidGUI(tk.Tk):
         if self.th.current != self._committed_theme:
             self.th.set_theme(self._committed_theme)
             committed_name = dict(self._theme_codes).get(self._committed_theme, self._committed_theme)
-            # avoid triggering extra preview during var update
+
             self.theme_var.set(committed_name)
             self._apply_theme()
 
     def _on_theme_popdown_unmap(self, _event=None) -> None:
-        # if dropdown closed without a committed selection (hover preview),
-        # keep preview until explicit commit or Escape; no auto-revert here
-        # to allow arrow-hover reload to stay visible. Escape reverts.
+
+
+
         pass
 
     def _start_theme_preview_poll(self) -> None:
@@ -1104,12 +1137,12 @@ class RapidGUI(tk.Tk):
             lb = self._get_theme_listbox()
             if lb is None:
                 return
-            # listbox may be empty before first post; skip then
+
             try:
                 if lb.size() == 0:  # type: ignore
                     self.after(80, self._poll_theme_preview)
                     return
-                # active index reflects hover or arrow navigation
+
                 idx = lb.index("active")  # type: ignore
                 name = lb.get(idx)  # type: ignore
                 name_to_code = {name: code for code, name in self._theme_codes}
@@ -1118,23 +1151,23 @@ class RapidGUI(tk.Tk):
                     self._preview_theme(code)
             except Exception:
                 pass
-            # continue polling while popdown stays mapped
+
             if pop.winfo_ismapped():  # type: ignore
                 self.after(80, self._poll_theme_preview)
         except Exception:
             pass
 
     def _on_theme_focus_out(self, _event=None) -> None:
-        # Delay check: if focus truly left the combobox (not moving to listbox),
-        # and preview is active but var still shows committed value (hover case),
-        # revert after short delay. Keyboard navigation that changed var keeps preview.
+
+
+
         def _check():
             try:
                 focused = self.focus_get()
             except Exception:
                 focused = None
             lb = self._get_theme_listbox()
-            # compare by Tcl window path, not Python wrapper identity
+
             try:
                 focused_path = str(focused) if focused is not None else ""
                 lb_path = lb._w if lb is not None else ""  # type: ignore
@@ -1144,14 +1177,14 @@ class RapidGUI(tk.Tk):
             except Exception:
                 if focused is not None and (focused == self.theme_combo or focused == lb):
                     return
-            # if popdown still mapped, user is still interacting
+
             if lb is not None:
                 try:
                     if lb.winfo_ismapped():
                         return
                 except Exception:
                     pass
-            # hover preview without var change -> revert
+
             committed_name = dict(self._theme_codes).get(self._committed_theme, self._committed_theme)
             if self.theme_var.get() == committed_name and self.th.current != self._committed_theme:
                 self._on_theme_preview_revert()
@@ -1227,6 +1260,113 @@ class RapidGUI(tk.Tk):
         self.log_text.configure(
             bg=c["log_background_color"], fg=c["log_text_color"], insertbackground=c["log_text_color"],
         )
+
+
+        if self.th.current == "rgb":
+            self._start_rgb_cycle()
+        else:
+            self._stop_rgb_cycle()
+
+    # ── RGB Cycle theme — slow and steady ──
+
+    @staticmethod
+    def _hsv_to_hex(h: float, s: float, v: float) -> str:
+        """h in 0-360, s/v in 0-1 → #rrggbb."""
+        h = (h % 360) / 360.0
+        r, g, b = colorsys.hsv_to_rgb(h, max(0, min(1, s)), max(0, min(1, v)))
+        return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+
+    def _update_rgb_catalog(self) -> None:
+        """Mutate the rgb catalog in-place based on current hue."""
+        h = self._rgb_hue % 360
+
+        cat = self.th.catalogs.get("rgb")
+        if cat is None:
+            return
+        cat["background_color"]       = self._hsv_to_hex(h, 0.55, 0.12)
+        cat["border_color"]           = self._hsv_to_hex(h, 0.35, 0.32)
+        cat["button_background_color"] = self._hsv_to_hex(h, 0.45, 0.20)
+        cat["input_background_color"]  = self._hsv_to_hex(h, 0.40, 0.16)
+        cat["accent_color"]           = self._hsv_to_hex(h, 0.85, 1.0)
+        cat["log_background_color"]   = self._hsv_to_hex(h, 0.60, 0.07)
+        cat["log_text_color"]         = self._hsv_to_hex((h + 180) % 360, 0.15, 0.95)
+
+        cat["text_color"]             = "#e6e6ff"
+        cat["secondary_text_color"]   = self._hsv_to_hex(h, 0.18, 0.72)
+        cat["button_text_color"]      = "#e6e6ff"
+        cat["input_text_color"]       = "#e6e6ff"
+
+    def _refresh_rgb_params(self) -> None:
+        """Reload interval/step from rgb.theme's cycle_interval_ms / cycle_step_deg if present."""
+        cfg = self.th.cycle_params.get("rgb", {})
+        try:
+            interval = int(float(cfg.get("cycle_interval_ms", self._rgb_interval_ms)))
+        except Exception:
+            interval = self._rgb_interval_ms
+        try:
+            step = float(cfg.get("cycle_step_deg", self._rgb_step_deg))
+        except Exception:
+            step = self._rgb_step_deg
+        self._rgb_interval_ms = max(10, min(1000, interval))
+        self._rgb_step_deg = max(0.05, min(10.0, step))
+
+    def _start_rgb_cycle(self) -> None:
+        if self._rgb_job is not None:
+            return
+        self._refresh_rgb_params()
+
+        self._update_rgb_catalog()
+        self._rgb_tick()
+
+    def _stop_rgb_cycle(self) -> None:
+        if self._rgb_job is not None:
+            try:
+                self.after_cancel(self._rgb_job)
+            except Exception:
+                pass
+            self._rgb_job = None
+
+    def _rgb_tick(self) -> None:
+        if self.th.current != "rgb":
+            self._rgb_job = None
+            return
+        self._refresh_rgb_params()
+        self._rgb_hue = (self._rgb_hue + self._rgb_step_deg) % 360
+        self._update_rgb_catalog()
+
+        if self.th.current == "rgb":
+
+            c = self.th.catalogs["rgb"]
+            self.configure(bg=c["background_color"])
+            self.style.configure(".", background=c["background_color"], foreground=c["text_color"])
+            self.style.configure("TFrame", background=c["background_color"])
+            self.style.configure("TLabelframe", background=c["background_color"], foreground=c["text_color"],
+                                 bordercolor=c["border_color"], darkcolor=c["border_color"], lightcolor=c["border_color"])
+            self.style.configure("TLabelframe.Label", background=c["background_color"], foreground=c["text_color"])
+            self.style.configure("TLabel", background=c["background_color"], foreground=c["text_color"])
+            self.style.configure("Muted.TLabel", background=c["background_color"], foreground=c["secondary_text_color"])
+            self.style.configure("TButton", background=c["button_background_color"], foreground=c["button_text_color"],
+                                 bordercolor=c["border_color"], darkcolor=c["button_background_color"], lightcolor=c["button_background_color"])
+            self.style.map("TButton", background=[("active", c["accent_color"]), ("disabled", c["button_background_color"])],
+                           foreground=[("disabled", c["secondary_text_color"])], bordercolor=[("disabled", c["border_color"])])
+            self.style.configure("TEntry", fieldbackground=c["input_background_color"], foreground=c["input_text_color"],
+                                 bordercolor=c["border_color"], darkcolor=c["border_color"], lightcolor=c["border_color"], insertcolor=c["input_text_color"])
+            self.style.configure("TSpinbox", fieldbackground=c["input_background_color"], foreground=c["input_text_color"],
+                                 background=c["button_background_color"], bordercolor=c["border_color"], darkcolor=c["border_color"], lightcolor=c["border_color"], arrowcolor=c["text_color"], insertcolor=c["input_text_color"])
+            self.style.configure("TCombobox", fieldbackground=c["input_background_color"], foreground=c["input_text_color"],
+                                 background=c["button_background_color"], bordercolor=c["border_color"], darkcolor=c["border_color"], lightcolor=c["border_color"], arrowcolor=c["text_color"])
+            self.style.map("TCombobox", fieldbackground=[("readonly", c["input_background_color"])], foreground=[("readonly", c["input_text_color"])], background=[("readonly", c["button_background_color"])])
+            self.option_add("*TCombobox*Listbox.background", c["input_background_color"])
+            self.option_add("*TCombobox*Listbox.foreground", c["input_text_color"])
+            self.option_add("*TCombobox*Listbox.selectBackground", c["accent_color"])
+            self.option_add("*TCombobox*Listbox.selectForeground", c["input_background_color"])
+            self.style.configure("TProgressbar", background=c["accent_color"], troughcolor=c["button_background_color"],
+                                 bordercolor=c["border_color"], darkcolor=c["accent_color"], lightcolor=c["accent_color"])
+            self.style.configure("TScrollbar", background=c["button_background_color"], troughcolor=c["background_color"],
+                                 bordercolor=c["border_color"], arrowcolor=c["text_color"])
+            self.style.map("TScrollbar", background=[("active", c["accent_color"])])
+            self.log_text.configure(bg=c["log_background_color"], fg=c["log_text_color"], insertbackground=c["log_text_color"])
+        self._rgb_job = self.after(self._rgb_interval_ms, self._rgb_tick)
 
     # ── Actions ──
 
@@ -1310,6 +1450,11 @@ class RapidGUI(tk.Tk):
             self.log_q.put(self.tr.t("cancel_requested"))
 
     def _on_close(self):
+
+        try:
+            self._stop_rgb_cycle()
+        except Exception:
+            pass
         if self.running:
             if not messagebox.askyesno(self.tr.t("confirm_close_title"), self.tr.t("confirm_close_msg")):
                 return
