@@ -1,6 +1,5 @@
 """
 RAPID — Reliable Asynchronous Parallel Internet Downloader
-Simple, functional Tkinter interface for the RAPID download engine.
 """
 
 from __future__ import annotations
