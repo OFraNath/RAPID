@@ -1,11 +1,13 @@
 # RAPID
 <b>Reliable Asynchronous Parallel Internet Downloader</b>
 
-How to run on Windows:
-`python RAPID.pyw` or just double click the file.
+This is a project I made myself for my own use; don't demand updates or features. Just give me suggestions or complain in the Issues tab.
 
-How to run on Linux:
-`python3 RAPID.pyw`
+The only thing I can guarantee is that errors will be resolved. I hope it will be as useful and amazing to whoever uses it as it is to me. The goal of this tool is to do the good part of IDM, which is to download things quickly, and on top of that, for free, forever.
+
+It's free, you use it at your own risk, and I assume absolutely no responsibility if you use it incorrectly or in an unintended way.
+
+Irrelevant note: I hate IDM.
 
 ## ⚖️ License
 
