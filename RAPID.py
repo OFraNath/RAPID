@@ -6,8 +6,10 @@ Usage:
     python RAPID.py
 
 Dependencies:
-    pip install requests urllib3
-    (tkinter ships with standard Python)
+    requests and urllib3 are installed automatically on first run if missing
+    (via "pip install"). tkinter ships with standard Python; if it's absent
+    the interpreter itself needs a tkinter-enabled Python install, which pip
+    cannot fix — the script will tell you how to get it.
 
 Internationalization (i18n):
     The program is built with English as the default/base language.
@@ -22,6 +24,83 @@ Internationalization (i18n):
 """
 
 from __future__ import annotations
+
+import importlib
+import subprocess
+import sys
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Self-installing dependencies
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Third-party packages (everything not shipped with the standard library) are
+# checked on startup and installed automatically with pip if missing, so the
+# user can just "python RAPID.py" without a manual setup step. tkinter is
+# stdlib but built into the Python interpreter itself, so it can't be pip
+# installed — if it's missing we just explain how to fix that instead.
+
+_THIRD_PARTY_PACKAGES = {
+    # import name -> pip package name (usually identical, kept separate in
+    # case a future dependency's import name differs from its PyPI name)
+    "requests": "requests",
+    "urllib3":  "urllib3",
+}
+
+
+def _ensure_dependencies() -> None:
+    missing = [
+        pip_name
+        for module_name, pip_name in _THIRD_PARTY_PACKAGES.items()
+        if importlib.util.find_spec(module_name) is None
+    ]
+    if not missing:
+        return
+
+    print(f"[RAPID] Missing dependencies: {', '.join(missing)}. Installing…")
+    try:
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *missing,
+        ])
+    except Exception as e:
+        print(f"[RAPID] Automatic install failed: {e}")
+        print(f"[RAPID] Please install manually:\n    {sys.executable} -m pip install {' '.join(missing)}")
+        sys.exit(1)
+
+    # Make the freshly installed packages importable without restarting.
+    importlib.invalidate_caches()
+    for module_name in _THIRD_PARTY_PACKAGES:
+        if module_name in sys.modules:
+            importlib.reload(sys.modules[module_name])
+
+    still_missing = [
+        pip_name
+        for module_name, pip_name in _THIRD_PARTY_PACKAGES.items()
+        if importlib.util.find_spec(module_name) is None
+    ]
+    if still_missing:
+        print(f"[RAPID] Still missing after install attempt: {', '.join(still_missing)}")
+        print(f"[RAPID] Please install manually:\n    {sys.executable} -m pip install {' '.join(still_missing)}")
+        sys.exit(1)
+
+    print("[RAPID] Dependencies installed successfully.")
+
+
+def _check_tkinter() -> None:
+    if importlib.util.find_spec("tkinter") is None:
+        print(
+            "[RAPID] The 'tkinter' module is missing from this Python install.\n"
+            "        pip cannot install it — it ships with the Python interpreter itself.\n"
+            "        Debian/Ubuntu:  sudo apt install python3-tk\n"
+            "        Fedora:         sudo dnf install python3-tkinter\n"
+            "        macOS (brew):   brew install python-tk\n"
+            "        Windows:        reinstall Python from python.org with the\n"
+            "                        \"tcl/tk and IDLE\" option checked."
+        )
+        sys.exit(1)
+
+
+_check_tkinter()
+_ensure_dependencies()
 
 import json
 import locale
