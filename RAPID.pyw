@@ -810,8 +810,8 @@ class RapidGUI(tk.Tk):
         self._rgb_interval_ms: int = int(self.th.cycle_params.get("rgb", {}).get("cycle_interval_ms", 80))
         self._rgb_step_deg: float = float(self.th.cycle_params.get("rgb", {}).get("cycle_step_deg", 0.5))
 
-        self._rgb_interval_ms = max(10, min(1000, self._rgb_interval_ms))
-        self._rgb_step_deg = max(0.05, min(10.0, self._rgb_step_deg))
+        self._rgb_interval_ms = max(50, min(1000, self._rgb_interval_ms))
+        self._rgb_step_deg = max(0.05, min(3.0, self._rgb_step_deg))
 
         self._log_buffer: "list[str]" = []
         self._fade_counter = 0
@@ -1220,7 +1220,31 @@ class RapidGUI(tk.Tk):
 
     def _apply_theme(self):
         c = self.th.colors()
+        self._apply_style_colors(c)
 
+        theme_lb = getattr(self, "_theme_listbox", None) or self._get_theme_listbox()
+        if theme_lb is not None:
+            try:
+                theme_lb.configure(
+                    background=c["input_background_color"],
+                    foreground=c["input_text_color"],
+                    selectbackground=c["accent_color"],
+                    selectforeground=c["input_background_color"],
+                )
+            except Exception:
+                pass
+
+        self.option_add("*TCombobox*Listbox.background", c["input_background_color"])
+        self.option_add("*TCombobox*Listbox.foreground", c["input_text_color"])
+        self.option_add("*TCombobox*Listbox.selectBackground", c["accent_color"])
+        self.option_add("*TCombobox*Listbox.selectForeground", c["input_background_color"])
+
+        if self.th.current == "rgb":
+            self._start_rgb_cycle()
+        else:
+            self._stop_rgb_cycle()
+
+    def _apply_style_colors(self, c: dict) -> None:
         self.configure(bg=c["background_color"])
 
         self.style.configure(".", background=c["background_color"], foreground=c["text_color"])
@@ -1269,22 +1293,6 @@ class RapidGUI(tk.Tk):
             foreground=[("readonly", c["input_text_color"])],
             background=[("readonly", c["button_background_color"])],
         )
-        self.option_add("*TCombobox*Listbox.background", c["input_background_color"])
-        self.option_add("*TCombobox*Listbox.foreground", c["input_text_color"])
-        self.option_add("*TCombobox*Listbox.selectBackground", c["accent_color"])
-        self.option_add("*TCombobox*Listbox.selectForeground", c["input_background_color"])
-
-        theme_lb = getattr(self, "_theme_listbox", None) or self._get_theme_listbox()
-        if theme_lb is not None:
-            try:
-                theme_lb.configure(
-                    background=c["input_background_color"],
-                    foreground=c["input_text_color"],
-                    selectbackground=c["accent_color"],
-                    selectforeground=c["input_background_color"],
-                )
-            except Exception:
-                pass
 
         self.style.configure(
             "TProgressbar", background=c["accent_color"], troughcolor=c["button_background_color"],
@@ -1300,12 +1308,6 @@ class RapidGUI(tk.Tk):
         self.log_text.configure(
             bg=c["log_background_color"], fg=c["log_text_color"], insertbackground=c["log_text_color"],
         )
-
-
-        if self.th.current == "rgb":
-            self._start_rgb_cycle()
-        else:
-            self._stop_rgb_cycle()
 
     # ── RGB Cycle theme — slow and steady ──
 
@@ -1347,8 +1349,8 @@ class RapidGUI(tk.Tk):
             step = float(cfg.get("cycle_step_deg", self._rgb_step_deg))
         except Exception:
             step = self._rgb_step_deg
-        self._rgb_interval_ms = max(10, min(1000, interval))
-        self._rgb_step_deg = max(0.05, min(10.0, step))
+        self._rgb_interval_ms = max(50, min(1000, interval))
+        self._rgb_step_deg = max(0.05, min(3.0, step))
 
     def _start_rgb_cycle(self) -> None:
         if self._rgb_job is not None:
@@ -1374,38 +1376,9 @@ class RapidGUI(tk.Tk):
         self._rgb_hue = (self._rgb_hue + self._rgb_step_deg) % 360
         self._update_rgb_catalog()
 
-        if self.th.current == "rgb":
+        c = self.th.catalogs["rgb"]
+        self._apply_style_colors(c)
 
-            c = self.th.catalogs["rgb"]
-            self.configure(bg=c["background_color"])
-            self.style.configure(".", background=c["background_color"], foreground=c["text_color"])
-            self.style.configure("TFrame", background=c["background_color"])
-            self.style.configure("TLabelframe", background=c["background_color"], foreground=c["text_color"],
-                                 bordercolor=c["border_color"], darkcolor=c["border_color"], lightcolor=c["border_color"])
-            self.style.configure("TLabelframe.Label", background=c["background_color"], foreground=c["text_color"])
-            self.style.configure("TLabel", background=c["background_color"], foreground=c["text_color"])
-            self.style.configure("Muted.TLabel", background=c["background_color"], foreground=c["secondary_text_color"])
-            self.style.configure("TButton", background=c["button_background_color"], foreground=c["button_text_color"],
-                                 bordercolor=c["border_color"], darkcolor=c["button_background_color"], lightcolor=c["button_background_color"])
-            self.style.map("TButton", background=[("active", c["accent_color"]), ("disabled", c["button_background_color"])],
-                           foreground=[("disabled", c["secondary_text_color"])], bordercolor=[("disabled", c["border_color"])])
-            self.style.configure("TEntry", fieldbackground=c["input_background_color"], foreground=c["input_text_color"],
-                                 bordercolor=c["border_color"], darkcolor=c["border_color"], lightcolor=c["border_color"], insertcolor=c["input_text_color"])
-            self.style.configure("TSpinbox", fieldbackground=c["input_background_color"], foreground=c["input_text_color"],
-                                 background=c["button_background_color"], bordercolor=c["border_color"], darkcolor=c["border_color"], lightcolor=c["border_color"], arrowcolor=c["text_color"], insertcolor=c["input_text_color"])
-            self.style.configure("TCombobox", fieldbackground=c["input_background_color"], foreground=c["input_text_color"],
-                                 background=c["button_background_color"], bordercolor=c["border_color"], darkcolor=c["border_color"], lightcolor=c["border_color"], arrowcolor=c["text_color"])
-            self.style.map("TCombobox", fieldbackground=[("readonly", c["input_background_color"])], foreground=[("readonly", c["input_text_color"])], background=[("readonly", c["button_background_color"])])
-            self.option_add("*TCombobox*Listbox.background", c["input_background_color"])
-            self.option_add("*TCombobox*Listbox.foreground", c["input_text_color"])
-            self.option_add("*TCombobox*Listbox.selectBackground", c["accent_color"])
-            self.option_add("*TCombobox*Listbox.selectForeground", c["input_background_color"])
-            self.style.configure("TProgressbar", background=c["accent_color"], troughcolor=c["button_background_color"],
-                                 bordercolor=c["border_color"], darkcolor=c["accent_color"], lightcolor=c["accent_color"])
-            self.style.configure("TScrollbar", background=c["button_background_color"], troughcolor=c["background_color"],
-                                 bordercolor=c["border_color"], arrowcolor=c["text_color"])
-            self.style.map("TScrollbar", background=[("active", c["accent_color"])])
-            self.log_text.configure(bg=c["log_background_color"], fg=c["log_text_color"], insertbackground=c["log_text_color"])
         self._rgb_job = self.after(self._rgb_interval_ms, self._rgb_tick)
 
     # ── Actions ──
