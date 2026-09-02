@@ -569,6 +569,7 @@ class Chunk:
     start: int
     end:   int
     done:  bool = False
+    bytes_done: int = 0
 
     @property
     def size(self) -> int:
@@ -594,6 +595,54 @@ class DownloadState:
     def bytes_downloaded(self) -> int:
         with self._lock:
             return self._bytes_done
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resume state persistence
+# ─────────────────────────────────────────────────────────────────────────────
+
+STATE_SUFFIX = ".rapidstate"
+
+
+def _state_path(file_name: str) -> Path:
+    return Path(str(file_name) + STATE_SUFFIX)
+
+
+def save_state(state: "DownloadState") -> None:
+    path = _state_path(state.file_name)
+    data = {
+        "url": state.url,
+        "file_name": state.file_name,
+        "total_bytes": state.total_bytes,
+        "chunks": [
+            {"index": c.index, "start": c.start, "end": c.end, "done": c.done, "bytes_done": c.bytes_done}
+            for c in state.chunks
+        ],
+    }
+    try:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def load_state(file_name: str) -> Optional[dict]:
+    path = _state_path(file_name)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def clear_state(file_name: str) -> None:
+    path = _state_path(file_name)
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -677,6 +726,7 @@ def worker(
     stop_event: threading.Event,
     log_q:     "queue.Queue[str]",
     tr:        Translator,
+    state_lock: Optional[threading.Lock] = None,
 ) -> None:
     while not stop_event.is_set():
         try:
@@ -684,13 +734,20 @@ def worker(
         except queue.Empty:
             return
 
-        headers = {"Range": f"bytes={chunk.start}-{chunk.end}"}
         success = False
 
         for attempt in range(1, MAX_RETRIES + 1):
             if stop_event.is_set():
                 chunk_q.task_done()
                 return
+
+            start = chunk.start + chunk.bytes_done
+            if start > chunk.end:
+                chunk.done = True
+                success = True
+                break
+
+            headers = {"Range": f"bytes={start}-{chunk.end}"}
             try:
                 resp = session.get(
                     state.url,
@@ -700,13 +757,25 @@ def worker(
                 )
                 resp.raise_for_status()
 
-                write_pos = chunk.start
+                if start > chunk.start and resp.status_code != 206:
+                    # Server ignored our partial Range request and is sending the
+                    # whole body from byte 0 — writing at `start` would corrupt the
+                    # file, so treat this chunk as if it were starting fresh.
+                    log.warning(
+                        f"[W{worker_id:02d}] chunk {chunk.index}: server did not honor Range "
+                        f"(status {resp.status_code}), restarting chunk from the beginning"
+                    )
+                    start = chunk.start
+                    chunk.bytes_done = 0
+
+                write_pos = start
                 buf = bytearray()
+                interrupted = False
 
                 for data in resp.iter_content(chunk_size=CHUNK_SIZE):
                     if stop_event.is_set():
-                        chunk_q.task_done()
-                        return
+                        interrupted = True
+                        break
                     if not data:
                         continue
                     buf.extend(data)
@@ -720,16 +789,34 @@ def worker(
                                 f.write(bytes(buf))
                         write_pos += len(buf)
                         buf.clear()
+                        chunk.bytes_done = write_pos - chunk.start
+                        if state_lock is not None:
+                            with state_lock:
+                                save_state(state)
 
                 if buf:
                     with file_lock:
                         with open(state.file_name, "r+b") as f:
                             f.seek(write_pos)
                             f.write(bytes(buf))
+                    write_pos += len(buf)
+                    buf.clear()
+                    chunk.bytes_done = write_pos - chunk.start
+                    if state_lock is not None:
+                        with state_lock:
+                            save_state(state)
+
+                if interrupted:
+                    chunk_q.task_done()
+                    return
 
                 chunk.done = True
+                chunk.bytes_done = chunk.size
                 success = True
                 log.info(tr.t("chunk_ok", worker_id=f"{worker_id:02d}", chunk=chunk.index, size=f"{chunk.size/1e6:.1f}"))
+                if state_lock is not None:
+                    with state_lock:
+                        save_state(state)
                 break
 
             except requests.exceptions.Timeout:
@@ -1556,29 +1643,63 @@ class RapidGUI(tk.Tk):
         ))
 
         if not info.accepts_range or info.total_bytes < MIN_SPLIT_SIZE:
-            chunks = [Chunk(index=0, start=0, end=max(info.total_bytes - 1, 0))]
+            fresh_chunks = [Chunk(index=0, start=0, end=max(info.total_bytes - 1, 0))]
         else:
-            chunks, offset, idx = [], 0, 0
+            fresh_chunks, offset, idx = [], 0, 0
             while offset < info.total_bytes:
                 end = min(offset + CHUNK_PART_SIZE - 1, info.total_bytes - 1)
-                chunks.append(Chunk(index=idx, start=offset, end=end))
+                fresh_chunks.append(Chunk(index=idx, start=offset, end=end))
                 offset = end + 1
                 idx += 1
+
+        saved = load_state(file_name)
+        resumed = bool(
+            saved
+            and saved.get("url") == url
+            and int(saved.get("total_bytes", -1)) == info.total_bytes
+            and Path(file_name).exists()
+            and Path(file_name).stat().st_size == info.total_bytes
+            and (len(saved.get("chunks", [])) <= 1 or info.accepts_range)
+        )
+
+        if resumed:
+            chunks = [
+                Chunk(
+                    index=c["index"], start=c["start"], end=c["end"],
+                    done=bool(c["done"]), bytes_done=int(c.get("bytes_done", 0)),
+                )
+                for c in saved["chunks"]
+            ]
+        else:
+            chunks = fresh_chunks
+            clear_state(file_name)
 
         self.state = DownloadState(
             url=url, file_name=file_name, total_bytes=info.total_bytes,
             n_workers=n_workers, chunks=chunks,
         )
 
-        try:
-            with open(file_name, "wb") as f:
-                if info.total_bytes > 0:
-                    f.seek(info.total_bytes - 1)
-                    f.write(b"\x00")
-        except OSError as e:
-            self.log.error(self.tr.t("error_create_file", error=e))
-            self._finish(success=False)
-            return
+        already_done = sum(c.bytes_done for c in chunks)
+        if already_done:
+            self.state._bytes_done = already_done
+
+        if resumed:
+            done_count = sum(1 for c in chunks if c.done)
+            self.log.info(
+                f"Resuming '{file_name}': {done_count}/{len(chunks)} chunks already complete "
+                f"({human_size(already_done)} of {human_size(info.total_bytes)})."
+            )
+        else:
+            try:
+                with open(file_name, "wb") as f:
+                    if info.total_bytes > 0:
+                        f.seek(info.total_bytes - 1)
+                        f.write(b"\x00")
+            except OSError as e:
+                self.log.error(self.tr.t("error_create_file", error=e))
+                self._finish(success=False)
+                return
+            save_state(self.state)
 
         self.log.info(self.tr.t(
             "starting_download",
@@ -1586,16 +1707,20 @@ class RapidGUI(tk.Tk):
         ))
 
         file_lock = threading.Lock()
+        state_lock = threading.Lock()
         chunk_q: "queue.Queue[Chunk]" = queue.Queue()
-        for c in chunks:
+        pending = [c for c in chunks if not c.done]
+        for c in pending:
             chunk_q.put(c)
 
-        with ThreadPoolExecutor(max_workers=min(n_workers, len(chunks))) as executor:
+        n_active = max(1, min(n_workers, len(pending)))
+        with ThreadPoolExecutor(max_workers=n_active) as executor:
             futures = [
                 executor.submit(
-                    worker, i, session, self.state, chunk_q, file_lock, self.log, self.stop_event, self.log_q, self.tr
+                    worker, i, session, self.state, chunk_q, file_lock, self.log, self.stop_event,
+                    self.log_q, self.tr, state_lock,
                 )
-                for i in range(min(n_workers, len(chunks)))
+                for i in range(n_active)
             ]
             for f in as_completed(futures):
                 try:
@@ -1604,16 +1729,19 @@ class RapidGUI(tk.Tk):
                     self.log.error(self.tr.t("worker_finished_error", error=e))
 
         if self.stop_event.is_set():
+            save_state(self.state)
             self.log.info(self.tr.t("cancelled_by_user"))
             self._finish(success=False)
             return
 
         failed = [c.index for c in self.state.chunks if not c.done]
         if failed:
+            save_state(self.state)
             self.log.warning(self.tr.t("chunks_incomplete", count=len(failed), list=failed[:10]))
             self._finish(success=False)
             return
 
+        clear_state(file_name)
         elapsed = time.monotonic() - self.start_time
         avg = info.total_bytes / elapsed / 1e6 if elapsed > 0 else 0
         self.log.info(self.tr.t(
