@@ -421,8 +421,29 @@ class ThemeManager:
             self.display_names[code] = display_name
 
     def available(self) -> list[tuple[str, str]]:
-        """Returns list of (code, display_name), Light first, then alphabetical."""
-        codes = sorted(self.catalogs.keys(), key=lambda c: (c != "light", self.display_names[c]))
+        """Returns list of (code, display_name) ordered for preview:
+
+        Light is always first (default), then remaining themes sorted
+        by background luminance (bright → dark). This groups light
+        themes together and dark themes together, so arrow Up/Down
+        and hover preview feel like a smooth light-to-dark sweep
+        instead of random alphabetical jumps.
+        """
+        def _lum(code: str) -> float:
+            hx = self.catalogs[code].get("background_color", "#808080").lstrip("#")
+            try:
+                r = int(hx[0:2], 16)
+                g = int(hx[2:4], 16)
+                b = int(hx[4:6], 16)
+                return 0.299 * r + 0.587 * g + 0.114 * b
+            except Exception:
+                return 0.0
+
+        # Light pinned first; rest by luminance bright→dark
+        codes = sorted(
+            self.catalogs.keys(),
+            key=lambda c: (c != "light", -_lum(c)),
+        )
         return [(c, self.display_names[c]) for c in codes]
 
     def set_theme(self, code: str) -> None:
@@ -780,6 +801,18 @@ class RapidGUI(tk.Tk):
         )
         theme_combo.pack(side="left", padx=(6, 0))
         theme_combo.bind("<<ComboboxSelected>>", self._on_theme_change)
+        # ── theme live preview (arrow keys / mouse hover) ──
+        self.theme_combo = theme_combo
+        self._committed_theme = self.th.current
+        self._theme_listbox = None  # cached Listbox widget for hover preview
+        # schedule hook after dropdown posts
+        theme_combo.bind("<Button-1>", lambda _e: self.after(20, self._hook_theme_listbox), add="+")
+        theme_combo.bind("<KeyPress>", self._on_theme_combo_keypress_hook, add="+")
+        for _seq in ("<KeyRelease-Up>", "<KeyRelease-Down>", "<KeyRelease-Prior>",
+                     "<KeyRelease-Next>", "<KeyRelease-Home>", "<KeyRelease-End>"):
+            theme_combo.bind(_seq, self._on_theme_key_preview, add="+")
+        theme_combo.bind("<Escape>", self._on_theme_preview_revert, add="+")
+        theme_combo.bind("<FocusOut>", self._on_theme_focus_out, add="+")
 
         self.frm_top = ttk.LabelFrame(self, text=self.tr.t("source_frame"))
         self.frm_top.pack(fill="x", **pad)
@@ -918,7 +951,211 @@ class RapidGUI(tk.Tk):
         code = name_to_code.get(self.theme_var.get(), DEFAULT_THEME)
         self.th.set_theme(code)
         save_app_config(theme=code, log=self.log)
+        self._committed_theme = code
         self._apply_theme()
+
+    # ── Theme live preview (arrow keys / mouse hover) ──
+
+    def _preview_theme(self, code: str) -> None:
+        """Apply theme immediately without persisting to config.cfg (preview)."""
+        if code not in self.th.catalogs:
+            return
+        if code == self.th.current:
+            return
+        self.th.set_theme(code)
+        self._apply_theme()
+
+    def _get_theme_listbox(self):
+        """Return a wrapper for the internal Listbox widget of the theme Combobox popdown, or None.
+
+        The popdown Listbox is created at Tcl level by ttk::combobox, so
+        tkinter's nametowidget cannot find it. We wrap the existing Tcl
+        window path manually (tk.Listbox.__new__) so Python bindings work.
+        """
+        try:
+            pop = self.tk.call("ttk::combobox::PopdownWindow", str(self.theme_combo))
+            lb_path = f"{pop}.f.l"
+            if str(self.tk.call("winfo", "exists", lb_path)) != "1":
+                return None
+            lb = tk.Listbox.__new__(tk.Listbox)  # type: ignore
+            lb.master = self  # type: ignore
+            lb._w = lb_path  # type: ignore
+            lb.tk = self.tk  # type: ignore
+            return lb
+        except Exception:
+            pass
+        return None
+
+    def _get_theme_popdown(self):
+        """Return a wrapper for the popdown Toplevel, or None."""
+        try:
+            pop = self.tk.call("ttk::combobox::PopdownWindow", str(self.theme_combo))
+            if str(self.tk.call("winfo", "exists", pop)) != "1":
+                return None
+            w = tk.Toplevel.__new__(tk.Toplevel)  # type: ignore
+            w.master = self  # type: ignore
+            w._w = pop  # type: ignore
+            w.tk = self.tk  # type: ignore
+            return w
+        except Exception:
+            return None
+
+    def _hook_theme_listbox(self) -> None:
+        lb = self._get_theme_listbox()
+        if lb is None:
+            # retry shortly — popdown may not be created yet
+            self.after(40, self._hook_theme_listbox)
+            return
+        lb_path = lb._w  # type: ignore
+        # avoid double-binding same Tcl path
+        hooked = getattr(self, "_theme_lb_hooked_paths", set())
+        first_time = lb_path not in hooked
+        if first_time:
+            try:
+                lb.bind("<Motion>", self._on_theme_listbox_hover, add="+")
+            except Exception:
+                # fallback via Tcl bind if wrapper fails
+                try:
+                    self.tk.call("bind", lb_path, "<Motion>", f"+{self._on_theme_listbox_hover}")
+                except Exception:
+                    pass
+            hooked.add(lb_path)
+            self._theme_lb_hooked_paths = hooked  # type: ignore
+            self._theme_listbox = lb
+            # also watch popdown unmap to handle focus cleanup
+            try:
+                pop_w = self._get_theme_popdown()
+                if pop_w is not None:
+                    pop_w.bind("<Unmap>", self._on_theme_popdown_unmap, add="+")
+            except Exception:
+                pass
+        # always (re)start polling active index while popdown is mapped (covers arrow keys + hover reliably)
+        self._start_theme_preview_poll()
+
+    def _on_theme_combo_keypress_hook(self, event=None) -> None:
+        # Hook listbox shortly after any key that may open the popdown
+        if event is not None and event.keysym in ("Up", "Down", "Next", "Prior", "Home", "End", "F4", "Alt_L", "Alt_R"):
+            self.after(20, self._hook_theme_listbox)
+
+    def _on_theme_listbox_hover(self, event) -> None:
+        lb = event.widget
+        try:
+            idx = lb.nearest(event.y)
+            if idx < 0:
+                return
+            name = lb.get(idx)
+        except Exception:
+            return
+        name_to_code = {name: code for code, name in self._theme_codes}
+        code = name_to_code.get(name)
+        if code:
+            self._preview_theme(code)
+
+    def _on_theme_key_preview(self, _event=None) -> None:
+        # defer so Tk has updated listbox/var state
+        self.after(10, self._do_theme_key_preview)
+
+    def _do_theme_key_preview(self) -> None:
+        code = None
+        lb = self._get_theme_listbox()
+        if lb is not None:
+            try:
+                if lb.winfo_ismapped():
+                    sel = lb.curselection()
+                    if sel:
+                        name = lb.get(sel[0])
+                    else:
+                        idx = lb.index("active")
+                        name = lb.get(idx)
+                    name_to_code = {name: code for code, name in self._theme_codes}
+                    code = name_to_code.get(name)
+            except Exception:
+                code = None
+        if code is None:
+            name = self.theme_var.get()
+            name_to_code = {name: code for code, name in self._theme_codes}
+            code = name_to_code.get(name)
+        if code:
+            self._preview_theme(code)
+
+    def _on_theme_preview_revert(self, _event=None) -> None:
+        if self.th.current != self._committed_theme:
+            self.th.set_theme(self._committed_theme)
+            committed_name = dict(self._theme_codes).get(self._committed_theme, self._committed_theme)
+            # avoid triggering extra preview during var update
+            self.theme_var.set(committed_name)
+            self._apply_theme()
+
+    def _on_theme_popdown_unmap(self, _event=None) -> None:
+        # if dropdown closed without a committed selection (hover preview),
+        # keep preview until explicit commit or Escape; no auto-revert here
+        # to allow arrow-hover reload to stay visible. Escape reverts.
+        pass
+
+    def _start_theme_preview_poll(self) -> None:
+        """Poll active Listbox index while popdown is mapped to catch arrow/hover."""
+        self._poll_theme_preview()
+
+    def _poll_theme_preview(self) -> None:
+        try:
+            pop = self._get_theme_popdown()
+            if pop is None or not pop.winfo_ismapped():  # type: ignore
+                return
+            lb = self._get_theme_listbox()
+            if lb is None:
+                return
+            # listbox may be empty before first post; skip then
+            try:
+                if lb.size() == 0:  # type: ignore
+                    self.after(80, self._poll_theme_preview)
+                    return
+                # active index reflects hover or arrow navigation
+                idx = lb.index("active")  # type: ignore
+                name = lb.get(idx)  # type: ignore
+                name_to_code = {name: code for code, name in self._theme_codes}
+                code = name_to_code.get(name)
+                if code and code != self.th.current:
+                    self._preview_theme(code)
+            except Exception:
+                pass
+            # continue polling while popdown stays mapped
+            if pop.winfo_ismapped():  # type: ignore
+                self.after(80, self._poll_theme_preview)
+        except Exception:
+            pass
+
+    def _on_theme_focus_out(self, _event=None) -> None:
+        # Delay check: if focus truly left the combobox (not moving to listbox),
+        # and preview is active but var still shows committed value (hover case),
+        # revert after short delay. Keyboard navigation that changed var keeps preview.
+        def _check():
+            try:
+                focused = self.focus_get()
+            except Exception:
+                focused = None
+            lb = self._get_theme_listbox()
+            # compare by Tcl window path, not Python wrapper identity
+            try:
+                focused_path = str(focused) if focused is not None else ""
+                lb_path = lb._w if lb is not None else ""  # type: ignore
+                combo_path = str(self.theme_combo)
+                if focused_path in (combo_path, lb_path):
+                    return
+            except Exception:
+                if focused is not None and (focused == self.theme_combo or focused == lb):
+                    return
+            # if popdown still mapped, user is still interacting
+            if lb is not None:
+                try:
+                    if lb.winfo_ismapped():
+                        return
+                except Exception:
+                    pass
+            # hover preview without var change -> revert
+            committed_name = dict(self._theme_codes).get(self._committed_theme, self._committed_theme)
+            if self.theme_var.get() == committed_name and self.th.current != self._committed_theme:
+                self._on_theme_preview_revert()
+        self.after(150, _check)
 
     def _apply_theme(self):
         c = self.th.colors()
