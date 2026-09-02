@@ -5,6 +5,7 @@ Simple, functional Tkinter interface for the RAPID download engine.
 
 from __future__ import annotations
 
+import configparser
 import importlib
 import importlib.util
 import logging
@@ -23,6 +24,7 @@ LANGUAGES_DIR = BASE_DIR / "languages"
 DEFAULT_LANG = "en"
 THEMES_DIR = BASE_DIR / "themes"
 DEFAULT_THEME = "light"
+CONFIG_FILE = BASE_DIR / "config.cfg"
 
 
 class _FlushRotatingFileHandler(RotatingFileHandler):
@@ -432,6 +434,77 @@ class ThemeManager:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# App config — persists theme / language to config.cfg
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_app_config(log: Optional[logging.Logger] = None) -> dict[str, str]:
+    """Load Preferences from CONFIG_FILE. Returns dict with optional keys:
+    'theme', 'language'. Missing/invalid file -> empty dict."""
+    if not CONFIG_FILE.is_file():
+        return {}
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(CONFIG_FILE, encoding="utf-8")
+        if parser.has_section("Preferences"):
+            cfg: dict[str, str] = {}
+            for key in ("theme", "language"):
+                if parser.has_option("Preferences", key):
+                    val = parser.get("Preferences", key).strip()
+                    if val:
+                        cfg[key] = val
+            return cfg
+        # Fallback: support flat key=value file without section header (legacy)
+        # If file has no section, try reading as if it were under [Preferences]
+        text = CONFIG_FILE.read_text(encoding="utf-8")
+        if "=" in text and "[" not in text:
+            parser2 = configparser.ConfigParser()
+            parser2.read_string("[Preferences]\n" + text)
+            cfg = {}
+            for key in ("theme", "language"):
+                if parser2.has_option("Preferences", key):
+                    val = parser2.get("Preferences", key).strip()
+                    if val:
+                        cfg[key] = val
+            return cfg
+    except Exception as e:
+        if log:
+            log.warning(f"Failed to load config.cfg: {e}")
+    return {}
+
+
+def save_app_config(
+    *,
+    theme: Optional[str] = None,
+    language: Optional[str] = None,
+    log: Optional[logging.Logger] = None,
+) -> None:
+    """Persist given preferences to CONFIG_FILE. Only provided values are updated;
+    existing unrelated keys are preserved. Atomic write via temp file + replace."""
+    parser = configparser.ConfigParser()
+    if CONFIG_FILE.is_file():
+        try:
+            parser.read(CONFIG_FILE, encoding="utf-8")
+        except Exception:
+            parser = configparser.ConfigParser()
+    if not parser.has_section("Preferences"):
+        parser.add_section("Preferences")
+    if theme is not None:
+        parser.set("Preferences", "theme", theme.strip().lower())
+    if language is not None:
+        parser.set("Preferences", "language", language.strip().lower())
+    try:
+        tmp = CONFIG_FILE.with_suffix(".cfg.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            parser.write(f)
+        tmp.replace(CONFIG_FILE)
+        if log:
+            log.info(f"Config saved to {CONFIG_FILE.name}: theme={theme} language={language}")
+    except Exception as e:
+        if log:
+            log.warning(f"Failed to save config.cfg: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Structures
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -651,8 +724,8 @@ class RapidGUI(tk.Tk):
             self.log = setup_logging(clear=True)
             self.log.info("GUI initialized")
         self.tr = Translator(LANGUAGES_DIR, self.log)
-        self.tr.set_language(self.tr.autodetect())
         self.th = ThemeManager(THEMES_DIR, self.log)
+        self._load_preferences()
         self.style = ttk.Style(self)
         try:
             self.style.theme_use("clam")
@@ -782,12 +855,38 @@ class RapidGUI(tk.Tk):
         except Exception:
             return False
 
+    # ── Preferences persistence ──
+
+    def _load_preferences(self) -> None:
+        """Load saved theme/language from config.cfg. Falls back to autodetect/default."""
+        cfg = load_app_config(self.log)
+        # Theme
+        saved_theme = cfg.get("theme", "").strip().lower()
+        if saved_theme:
+            if saved_theme in self.th.catalogs:
+                self.th.set_theme(saved_theme)
+                self.log.info(f"Loaded theme from config.cfg: {saved_theme}")
+            else:
+                self.log.warning(f"Saved theme '{saved_theme}' not found in {list(self.th.catalogs.keys())}, using default")
+        # Language
+        saved_lang = cfg.get("language", "").strip().lower()
+        if saved_lang:
+            if saved_lang in self.tr.catalogs:
+                self.tr.set_language(saved_lang)
+                self.log.info(f"Loaded language from config.cfg: {saved_lang}")
+            else:
+                self.log.warning(f"Saved language '{saved_lang}' not found, using autodetect")
+                self.tr.set_language(self.tr.autodetect())
+        else:
+            self.tr.set_language(self.tr.autodetect())
+
     # ── i18n ──
 
     def _on_language_change(self, _event=None):
         name_to_code = {name: code for code, name in self._lang_codes}
         code = name_to_code.get(self.lang_var.get(), DEFAULT_LANG)
         self.tr.set_language(code)
+        save_app_config(language=code, log=self.log)
         self._retranslate_static_ui()
 
     def _retranslate_static_ui(self):
@@ -818,6 +917,7 @@ class RapidGUI(tk.Tk):
         name_to_code = {name: code for code, name in self._theme_codes}
         code = name_to_code.get(self.theme_var.get(), DEFAULT_THEME)
         self.th.set_theme(code)
+        save_app_config(theme=code, log=self.log)
         self._apply_theme()
 
     def _apply_theme(self):

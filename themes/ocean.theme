@@ -1,0 +1,19 @@
+{
+    "_meta_name": "Ocean",
+
+    "background_color":        "#0e1a2b",
+    "text_color":               "#c7e8f3",
+    "secondary_text_color":     "#6e9ab0",
+    "border_color":             "#1e3a5f",
+
+    "button_background_color":  "#1e3a5f",
+    "button_text_color":        "#c7e8f3",
+
+    "input_background_color":   "#162a44",
+    "input_text_color":         "#c7e8f3",
+
+    "accent_color":             "#00b4d8",
+
+    "log_background_color":     "#080f1a",
+    "log_text_color":           "#7ec8e3"
+}

@@ -1,0 +1,19 @@
+{
+    "_meta_name": "Cherry",
+
+    "background_color":        "#fff0f3",
+    "text_color":               "#4a1028",
+    "secondary_text_color":     "#a65a6e",
+    "border_color":             "#ffb3c1",
+
+    "button_background_color":  "#ffc2cf",
+    "button_text_color":        "#4a1028",
+
+    "input_background_color":   "#ffffff",
+    "input_text_color":         "#4a1028",
+
+    "accent_color":             "#e5386d",
+
+    "log_background_color":     "#1a0a0f",
+    "log_text_color":           "#ffb3c6"
+}

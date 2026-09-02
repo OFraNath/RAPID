@@ -1,0 +1,19 @@
+{
+    "_meta_name": "Lunar",
+
+    "background_color":        "#1a1d23",
+    "text_color":               "#d8dee9",
+    "secondary_text_color":     "#8a95a8",
+    "border_color":             "#2e3440",
+
+    "button_background_color":  "#2e3440",
+    "button_text_color":        "#eceff4",
+
+    "input_background_color":   "#242933",
+    "input_text_color":         "#eceff4",
+
+    "accent_color":             "#88c0d0",
+
+    "log_background_color":     "#0f1215",
+    "log_text_color":           "#d8dee9"
+}

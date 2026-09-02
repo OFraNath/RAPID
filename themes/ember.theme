@@ -1,0 +1,19 @@
+{
+    "_meta_name": "Ember",
+
+    "background_color":        "#2b1d0e",
+    "text_color":               "#f5e6cc",
+    "secondary_text_color":     "#c9a57a",
+    "border_color":             "#5c3a21",
+
+    "button_background_color":  "#5c3a21",
+    "button_text_color":        "#f5e6cc",
+
+    "input_background_color":   "#3d2616",
+    "input_text_color":         "#f5e6cc",
+
+    "accent_color":             "#ff6b35",
+
+    "log_background_color":     "#1a1208",
+    "log_text_color":           "#ffb485"
+}

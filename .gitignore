@@ -1,1 +1,5 @@
 rapid.log
+config.cfg
+config.cfg.tmp
+
+__pycache__/
