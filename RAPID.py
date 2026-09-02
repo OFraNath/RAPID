@@ -24,6 +24,7 @@ Internationalization (i18n):
 from __future__ import annotations
 
 import json
+import locale
 import logging
 import queue
 import threading
@@ -194,6 +195,53 @@ class Translator:
             except Exception:
                 return template
         return template
+
+    def autodetect(self) -> str:
+        """
+        Tries to guess the system's language and returns the best matching
+        available code (falling back to DEFAULT_LANG if nothing matches).
+        Does not change self.current — call set_language() with the result.
+        """
+        candidates: list[str] = []
+        try:
+            # locale.getlocale() is preferred over the deprecated getdefaultlocale().
+            for getter in (locale.getlocale, locale.getdefaultlocale):
+                try:
+                    loc = getter()
+                except Exception:
+                    continue
+                if loc and loc[0]:
+                    candidates.append(loc[0])
+        except Exception:
+            pass
+
+        # Also check common environment variables (useful on Linux/macOS).
+        import os
+        for var in ("LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"):
+            val = os.environ.get(var)
+            if val:
+                candidates.append(val.split(":")[0])
+
+        available = set(self.catalogs.keys())
+
+        for raw in candidates:
+            if not raw:
+                continue
+            # Normalize e.g. "pt_BR.UTF-8" -> "pt-br", "en_US" -> "en-us"
+            norm = raw.split(".")[0].replace("_", "-").lower()
+            if norm in available:
+                return norm
+            # Try just the primary subtag: "pt-br" -> "pt"
+            primary = norm.split("-")[0]
+            if primary in available:
+                return primary
+            # Try matching an available code by its primary subtag too,
+            # e.g. system "pt-pt" should still match an available "pt-br".
+            for code in available:
+                if code.split("-")[0] == primary:
+                    return code
+
+        return DEFAULT_LANG
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -411,6 +459,7 @@ class RapidGUI(tk.Tk):
 
         self.log = setup_logging()
         self.tr = Translator(LANGUAGES_DIR, self.log)
+        self.tr.set_language(self.tr.autodetect())
 
         self.title(self.tr.t("window_title"))
         self.geometry("640x560")
