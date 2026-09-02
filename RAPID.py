@@ -1,25 +1,6 @@
 """
-RAPID GUI — Reliable Asynchronous Parallel Internet Downloader
+RAPID — Reliable Asynchronous Parallel Internet Downloader
 Simple, functional Tkinter interface for the RAPID download engine.
-
-Usage:
-    python RAPID.py
-
-Dependencies:
-    requests and urllib3 are installed automatically on first run if missing
-    (via "pip install"). tkinter ships with standard Python; if it's absent
-    the interpreter itself needs a tkinter-enabled Python install, which pip
-    cannot fix — the script will tell you how to get it.
-
-Internationalization (i18n):
-    Languages are loaded from the "languages" folder next to this script.
-    Any file named "<code>.language" (e.g. "en.language", "pt-br.language")
-    containing a flat JSON object of translation keys will be picked up
-    automatically and offered in the language selector.
-
-    English is not built-in — it is loaded from languages/en.language like
-    any other language. If a key is missing, fallback is languages/en.language,
-    then the key name itself.
 """
 
 from __future__ import annotations
