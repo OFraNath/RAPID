@@ -27,23 +27,142 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import logging
 import subprocess
 import sys
 import os
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Early logging — must be FIRST so crashes are captured
+# ─────────────────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parent
+LOG_FILE = BASE_DIR / "rapid.log"
+LANGUAGES_DIR = BASE_DIR / "languages"
+DEFAULT_LANG = "en"
+THEMES_DIR = BASE_DIR / "themes"
+DEFAULT_THEME = "light"
+
+
+class _FlushRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler that fsyncs after every emit for real-time persistence."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        try:
+            if self.stream:
+                self.stream.flush()
+                try:
+                    os.fsync(self.stream.fileno())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+def setup_logging(debug: bool = False, clear: bool = False) -> logging.Logger:
+    log = logging.getLogger("rapid_gui")
+    log.setLevel(logging.DEBUG if debug else logging.INFO)
+    for h in list(log.handlers):
+        try:
+            h.close()
+        except Exception:
+            pass
+    log.handlers.clear()
+    log.propagate = False
+
+    if clear:
+        try:
+            LOG_FILE.write_text("", encoding="utf-8")
+        except Exception:
+            pass
+        for p in LOG_FILE.parent.glob(f"{LOG_FILE.name}.*"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+    fh = _FlushRotatingFileHandler(
+        LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8", delay=False
+    )
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    fh.setLevel(logging.DEBUG)
+    log.addHandler(fh)
+    return log
+
+
+_EARLY_LOG = setup_logging(clear=True)
+
+
+def _install_crash_handlers(log: logging.Logger) -> None:
+    orig_excepthook = sys.excepthook
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        try:
+            log.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+            for h in log.handlers:
+                try:
+                    h.flush()
+                    if hasattr(h.stream, "fileno"):
+                        os.fsync(h.stream.fileno())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        orig_excepthook(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _excepthook
+
+    _thr = sys.modules.get("threading")
+    orig_thread_hook = getattr(_thr, "excepthook", None) if _thr is not None else None
+
+    def _thread_excepthook(args):
+        try:
+            log.critical(
+                f"Uncaught exception in thread {args.thread.name if args.thread else '?'}",
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            )
+            for h in log.handlers:
+                try:
+                    h.flush()
+                    if hasattr(h.stream, "fileno"):
+                        os.fsync(h.stream.fileno())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if orig_thread_hook:
+            try:
+                orig_thread_hook(args)
+            except Exception:
+                pass
+        else:
+            import traceback
+
+            traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+
+    try:
+        import threading
+
+        threading.excepthook = _thread_excepthook
+    except Exception:
+        pass
+
+
+try:
+    import threading
+
+    _install_crash_handlers(_EARLY_LOG)
+    _EARLY_LOG.info("=== RAPID started ===")
+except Exception:
+    pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Self-installing dependencies
 # ─────────────────────────────────────────────────────────────────────────────
-#
-# Third-party packages (everything not shipped with the standard library) are
-# checked on startup and installed automatically with pip if missing, so the
-# user can just "python RAPID.py" without a manual setup step. tkinter is
-# stdlib but built into the Python interpreter itself, so it can't be pip
-# installed — if it's missing we just explain how to fix that instead.
 
 _THIRD_PARTY_PACKAGES = {
-    # import name -> pip package name (usually identical, kept separate in
-    # case a future dependency's import name differs from its PyPI name)
     "requests": "requests",
     "urllib3":  "urllib3",
 }
@@ -56,19 +175,23 @@ def _ensure_dependencies() -> None:
         if importlib.util.find_spec(module_name) is None
     ]
     if not missing:
+        _EARLY_LOG.debug("All third-party dependencies present.")
         return
 
-    print(f"[RAPID] Missing dependencies: {', '.join(missing)}. Installing…")
+    msg = f"Missing dependencies: {', '.join(missing)}. Installing…"
+    print(f"[RAPID] {msg}")
+    _EARLY_LOG.info(msg)
     try:
         subprocess.check_call([
             sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *missing,
         ])
     except Exception as e:
-        print(f"[RAPID] Automatic install failed: {e}")
+        err = f"Automatic install failed: {e}"
+        print(f"[RAPID] {err}")
+        _EARLY_LOG.critical(err, exc_info=True)
         print(f"[RAPID] Please install manually:\n    {sys.executable} -m pip install {' '.join(missing)}")
         sys.exit(1)
 
-    # Make the freshly installed packages importable without restarting.
     importlib.invalidate_caches()
     for module_name in _THIRD_PARTY_PACKAGES:
         if module_name in sys.modules:
@@ -80,17 +203,21 @@ def _ensure_dependencies() -> None:
         if importlib.util.find_spec(module_name) is None
     ]
     if still_missing:
-        print(f"[RAPID] Still missing after install attempt: {', '.join(still_missing)}")
+        err = f"Still missing after install attempt: {', '.join(still_missing)}"
+        print(f"[RAPID] {err}")
+        _EARLY_LOG.critical(err)
         print(f"[RAPID] Please install manually:\n    {sys.executable} -m pip install {' '.join(still_missing)}")
         sys.exit(1)
 
-    print("[RAPID] Dependencies installed successfully.")
+    ok = "Dependencies installed successfully."
+    print(f"[RAPID] {ok}")
+    _EARLY_LOG.info(ok)
 
 
 def _check_tkinter() -> None:
     if importlib.util.find_spec("tkinter") is None:
-        print(
-            "[RAPID] The 'tkinter' module is missing from this Python install.\n"
+        err = (
+            "The 'tkinter' module is missing from this Python install.\n"
             "        pip cannot install it — it ships with the Python interpreter itself.\n"
             "        Debian/Ubuntu:  sudo apt install python3-tk\n"
             "        Fedora:         sudo dnf install python3-tkinter\n"
@@ -98,6 +225,8 @@ def _check_tkinter() -> None:
             "        Windows:        reinstall Python from python.org with the\n"
             "                        \"tcl/tk and IDLE\" option checked."
         )
+        print(f"[RAPID] {err}")
+        _EARLY_LOG.critical(err)
         sys.exit(1)
 
 
@@ -106,15 +235,12 @@ _ensure_dependencies()
 
 import json
 import locale
-import logging
 import queue
 import threading
 import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 from urllib.parse import unquote, urlparse
@@ -129,43 +255,24 @@ from urllib3.util.retry import Retry
 
 DEFAULT_WORKERS = 16
 MAX_WORKERS     = 32
-CHUNK_SIZE      = 1  * 1024 * 1024   # 1 MB per stream read
-CHUNK_PART_SIZE = 64 * 1024 * 1024   # 64 MB per queue slice
-MIN_SPLIT_SIZE  = 8  * 1024 * 1024   # below this, don't split
+CHUNK_SIZE      = 1  * 1024 * 1024
+CHUNK_PART_SIZE = 64 * 1024 * 1024
+MIN_SPLIT_SIZE  = 8  * 1024 * 1024
 MAX_RETRIES     = 6
 CONNECT_TIMEOUT = 15
 READ_TIMEOUT    = 45
-WRITE_BUF_SIZE  = 4  * 1024 * 1024   # 4 MB write buffer
+WRITE_BUF_SIZE  = 4  * 1024 * 1024
 
-# Everything (log and downloads) is restricted to the directory the script runs from.
-BASE_DIR        = Path(__file__).resolve().parent
-LOG_FILE        = BASE_DIR / "rapid.log"
-LANGUAGES_DIR   = BASE_DIR / "languages"
-DEFAULT_LANG    = "en"
-
-
-def setup_logging(debug: bool = False) -> logging.Logger:
-    log = logging.getLogger("rapid_gui")
-    log.setLevel(logging.DEBUG if debug else logging.INFO)
-    log.handlers.clear()
-
-    fh = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    fh.setLevel(logging.DEBUG)
-    log.addHandler(fh)
-    return log
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # i18n — translation loader
 # ─────────────────────────────────────────────────────────────────────────────
-#
-# Built-in English strings act as the ultimate fallback, so the app always
-# works even if the "languages" folder or "en.language" file is missing.
 
 _BUILTIN_EN = {
     "window_title": "RAPID — Reliable Asynchronous Parallel Internet Downloader",
     "language_label": "Language:",
+    "theme_label": "Theme:",
 
     "source_frame": "Source",
     "url_label": "URL:",
@@ -252,7 +359,6 @@ class Translator:
                 continue
 
             display_name = str(data.get("_meta_name", code))
-            # Merge on top of English so missing keys fall back automatically.
             merged = dict(_BUILTIN_EN)
             merged.update({k: v for k, v in data.items() if k != "_meta_name"})
             self.catalogs[code] = merged
@@ -285,7 +391,6 @@ class Translator:
         """
         candidates: list[str] = []
         try:
-            # locale.getlocale() is preferred over the deprecated getdefaultlocale().
             for getter in (locale.getlocale, locale.getdefaultlocale):
                 try:
                     loc = getter()
@@ -296,7 +401,6 @@ class Translator:
         except Exception:
             pass
 
-        # Also check common environment variables (useful on Linux/macOS).
         for var in ("LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"):
             val = os.environ.get(var)
             if val:
@@ -307,21 +411,90 @@ class Translator:
         for raw in candidates:
             if not raw:
                 continue
-            # Normalize e.g. "pt_BR.UTF-8" -> "pt-br", "en_US" -> "en-us"
             norm = raw.split(".")[0].replace("_", "-").lower()
             if norm in available:
                 return norm
-            # Try just the primary subtag: "pt-br" -> "pt"
             primary = norm.split("-")[0]
             if primary in available:
                 return primary
-            # Try matching an available code by its primary subtag too,
-            # e.g. system "pt-pt" should still match an available "pt-br".
             for code in available:
                 if code.split("-")[0] == primary:
                     return code
 
         return DEFAULT_LANG
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Theming — theme loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BUILTIN_LIGHT = {
+    "_meta_name": "Light",
+    "background_color":        "#f0f0f0",
+    "text_color":               "#000000",
+    "secondary_text_color":     "#555555",
+    "border_color":             "#b5b5b5",
+    "button_background_color":  "#e6e6e6",
+    "button_text_color":        "#000000",
+    "input_background_color":   "#ffffff",
+    "input_text_color":         "#000000",
+    "accent_color":             "#3a7bd5",
+    "log_background_color":     "#111111",
+    "log_text_color":           "#dddddd",
+}
+
+THEME_KEYS = [k for k in _BUILTIN_LIGHT if k != "_meta_name"]
+
+
+class ThemeManager:
+    """
+    Loads *.theme files from THEMES_DIR (flat JSON key -> hex color string).
+    Each file's code is its filename stem (e.g. "dark.theme" -> "dark").
+    The built-in "light" theme is always available and is used as the
+    fallback for any missing file or missing key in any theme.
+    """
+
+    def __init__(self, themes_dir: Path, log: Optional[logging.Logger] = None):
+        self.themes_dir = themes_dir
+        self.log = log
+        self.catalogs: dict[str, dict[str, str]] = {"light": dict(_BUILTIN_LIGHT)}
+        self.display_names: dict[str, str] = {"light": "Light"}
+        self.current = DEFAULT_THEME
+        self._discover()
+
+    def _discover(self) -> None:
+        if not self.themes_dir.is_dir():
+            return
+        for path in sorted(self.themes_dir.glob("*.theme")):
+            code = path.stem.strip().lower()
+            if not code:
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("root JSON element must be an object")
+            except Exception as e:
+                if self.log:
+                    self.log.warning(f"Failed to load theme file '{path.name}': {e}")
+                continue
+
+            display_name = str(data.get("_meta_name", code))
+            merged = dict(_BUILTIN_LIGHT)
+            merged.update({k: v for k, v in data.items() if k in THEME_KEYS})
+            self.catalogs[code] = merged
+            self.display_names[code] = display_name
+
+    def available(self) -> list[tuple[str, str]]:
+        """Returns list of (code, display_name), Light first, then alphabetical."""
+        codes = sorted(self.catalogs.keys(), key=lambda c: (c != "light", self.display_names[c]))
+        return [(c, self.display_names[c]) for c in codes]
+
+    def set_theme(self, code: str) -> None:
+        code = code.lower()
+        self.current = code if code in self.catalogs else DEFAULT_THEME
+
+    def colors(self) -> dict[str, str]:
+        return self.catalogs.get(self.current, _BUILTIN_LIGHT)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -537,9 +710,20 @@ class RapidGUI(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.log = setup_logging()
+        try:
+            self.log = setup_logging(clear=True)
+            self.log.info("GUI initialized")
+        except NameError:
+            self.log = setup_logging(clear=True)
+            self.log.info("GUI initialized")
         self.tr = Translator(LANGUAGES_DIR, self.log)
         self.tr.set_language(self.tr.autodetect())
+        self.th = ThemeManager(THEMES_DIR, self.log)
+        self.style = ttk.Style(self)
+        try:
+            self.style.theme_use("clam")
+        except tk.TclError:
+            pass
 
         self.title(self.tr.t("window_title"))
         self.geometry("640x560")
@@ -554,6 +738,7 @@ class RapidGUI(tk.Tk):
         self.running = False
 
         self._build_ui()
+        self._apply_theme()
         self.after(150, self._poll_log)
         self.after(200, self._poll_progress)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -563,12 +748,11 @@ class RapidGUI(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 6, "pady": 4}
 
-        # Language selector
         frm_lang = ttk.Frame(self)
         frm_lang.pack(fill="x", padx=6, pady=(6, 0))
         ttk.Label(frm_lang, text=self.tr.t("language_label")).pack(side="left")
 
-        self._lang_codes = self.tr.available()  # list[(code, display_name)]
+        self._lang_codes = self.tr.available()
         self.lang_var = tk.StringVar(value=dict(self._lang_codes).get(self.tr.current, "English"))
         lang_combo = ttk.Combobox(
             frm_lang, textvariable=self.lang_var, state="readonly",
@@ -576,6 +760,17 @@ class RapidGUI(tk.Tk):
         )
         lang_combo.pack(side="left", padx=(6, 0))
         lang_combo.bind("<<ComboboxSelected>>", self._on_language_change)
+
+        ttk.Label(frm_lang, text=self.tr.t("theme_label")).pack(side="left", padx=(18, 0))
+
+        self._theme_codes = self.th.available()
+        self.theme_var = tk.StringVar(value=dict(self._theme_codes).get(self.th.current, "Light"))
+        theme_combo = ttk.Combobox(
+            frm_lang, textvariable=self.theme_var, state="readonly",
+            values=[name for _, name in self._theme_codes], width=16,
+        )
+        theme_combo.pack(side="left", padx=(6, 0))
+        theme_combo.bind("<<ComboboxSelected>>", self._on_theme_change)
 
         self.frm_top = ttk.LabelFrame(self, text=self.tr.t("source_frame"))
         self.frm_top.pack(fill="x", **pad)
@@ -601,11 +796,11 @@ class RapidGUI(tk.Tk):
         ttk.Spinbox(self.frm_top, from_=1, to=MAX_WORKERS, textvariable=self.workers_var, width=6).grid(row=2, column=1, sticky="w", **pad)
 
         self.info_var = tk.StringVar(value=self.tr.t("info_default"))
-        ttk.Label(self.frm_top, textvariable=self.info_var, foreground="#555").grid(row=2, column=2, columnspan=3, sticky="w", **pad)
+        self.lbl_info = ttk.Label(self.frm_top, textvariable=self.info_var, style="Muted.TLabel")
+        self.lbl_info.grid(row=2, column=2, columnspan=3, sticky="w", **pad)
 
         self.frm_top.columnconfigure(1, weight=1)
 
-        # Action buttons
         frm_actions = ttk.Frame(self)
         frm_actions.pack(fill="x", **pad)
 
@@ -618,7 +813,6 @@ class RapidGUI(tk.Tk):
         self.btn_open_log = ttk.Button(frm_actions, text=self.tr.t("open_log_btn"), command=self._open_log)
         self.btn_open_log.pack(side="right", padx=4)
 
-        # Progress
         self.frm_prog = ttk.LabelFrame(self, text=self.tr.t("progress_frame"))
         self.frm_prog.pack(fill="x", **pad)
 
@@ -628,11 +822,10 @@ class RapidGUI(tk.Tk):
         self.status_var = tk.StringVar(value=self.tr.t("status_ready"))
         ttk.Label(self.frm_prog, textvariable=self.status_var).pack(anchor="w", padx=6, pady=(0, 6))
 
-        # Log
         self.frm_log = ttk.LabelFrame(self, text=self.tr.t("log_frame"))
         self.frm_log.pack(fill="both", expand=True, **pad)
 
-        self.log_text = tk.Text(self.frm_log, height=16, bg="#111", fg="#ddd", insertbackground="#ddd",
+        self.log_text = tk.Text(self.frm_log, height=16,
                                  font=("Consolas", 9) if self._font_ok("Consolas") else ("Courier", 9))
         self.log_text.pack(fill="both", expand=True, side="left", padx=(6, 0), pady=6)
         scroll = ttk.Scrollbar(self.frm_log, command=self.log_text.yview)
@@ -640,11 +833,11 @@ class RapidGUI(tk.Tk):
         self.log_text.configure(yscrollcommand=scroll.set)
         self.log_text.configure(state="disabled")
 
-        # Footer with stats
         frm_stats = ttk.Frame(self)
         frm_stats.pack(fill="x", **pad)
         self.stats_var = tk.StringVar(value="")
-        ttk.Label(frm_stats, textvariable=self.stats_var, foreground="#333").pack(anchor="w")
+        self.lbl_stats = ttk.Label(frm_stats, textvariable=self.stats_var, style="Muted.TLabel")
+        self.lbl_stats.pack(anchor="w")
 
     def _font_ok(self, name: str) -> bool:
         try:
@@ -681,6 +874,85 @@ class RapidGUI(tk.Tk):
         if self.info is None:
             self.info_var.set(self.tr.t("info_default"))
 
+    # ----------------------------------------------------------- Theming ----
+
+    def _on_theme_change(self, _event=None):
+        name_to_code = {name: code for code, name in self._theme_codes}
+        code = name_to_code.get(self.theme_var.get(), DEFAULT_THEME)
+        self.th.set_theme(code)
+        self._apply_theme()
+
+    def _apply_theme(self):
+        c = self.th.colors()
+
+        self.configure(bg=c["background_color"])
+
+        self.style.configure(".", background=c["background_color"], foreground=c["text_color"])
+        self.style.configure("TFrame", background=c["background_color"])
+
+        self.style.configure(
+            "TLabelframe", background=c["background_color"], foreground=c["text_color"],
+            bordercolor=c["border_color"], darkcolor=c["border_color"], lightcolor=c["border_color"],
+        )
+        self.style.configure("TLabelframe.Label", background=c["background_color"], foreground=c["text_color"])
+        self.style.configure("TLabel", background=c["background_color"], foreground=c["text_color"])
+        self.style.configure("Muted.TLabel", background=c["background_color"], foreground=c["secondary_text_color"])
+
+        self.style.configure(
+            "TButton", background=c["button_background_color"], foreground=c["button_text_color"],
+            bordercolor=c["border_color"], darkcolor=c["button_background_color"], lightcolor=c["button_background_color"],
+        )
+        self.style.map(
+            "TButton",
+            background=[("active", c["accent_color"]), ("disabled", c["button_background_color"])],
+            foreground=[("disabled", c["secondary_text_color"])],
+            bordercolor=[("disabled", c["border_color"])],
+        )
+
+        self.style.configure(
+            "TEntry", fieldbackground=c["input_background_color"], foreground=c["input_text_color"],
+            bordercolor=c["border_color"], darkcolor=c["border_color"], lightcolor=c["border_color"],
+            insertcolor=c["input_text_color"],
+        )
+
+        self.style.configure(
+            "TSpinbox", fieldbackground=c["input_background_color"], foreground=c["input_text_color"],
+            background=c["button_background_color"], bordercolor=c["border_color"],
+            darkcolor=c["border_color"], lightcolor=c["border_color"], arrowcolor=c["text_color"],
+            insertcolor=c["input_text_color"],
+        )
+
+        self.style.configure(
+            "TCombobox", fieldbackground=c["input_background_color"], foreground=c["input_text_color"],
+            background=c["button_background_color"], bordercolor=c["border_color"],
+            darkcolor=c["border_color"], lightcolor=c["border_color"], arrowcolor=c["text_color"],
+        )
+        self.style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", c["input_background_color"])],
+            foreground=[("readonly", c["input_text_color"])],
+            background=[("readonly", c["button_background_color"])],
+        )
+        self.option_add("*TCombobox*Listbox.background", c["input_background_color"])
+        self.option_add("*TCombobox*Listbox.foreground", c["input_text_color"])
+        self.option_add("*TCombobox*Listbox.selectBackground", c["accent_color"])
+        self.option_add("*TCombobox*Listbox.selectForeground", c["input_background_color"])
+
+        self.style.configure(
+            "TProgressbar", background=c["accent_color"], troughcolor=c["button_background_color"],
+            bordercolor=c["border_color"], darkcolor=c["accent_color"], lightcolor=c["accent_color"],
+        )
+
+        self.style.configure(
+            "TScrollbar", background=c["button_background_color"], troughcolor=c["background_color"],
+            bordercolor=c["border_color"], arrowcolor=c["text_color"],
+        )
+        self.style.map("TScrollbar", background=[("active", c["accent_color"])])
+
+        self.log_text.configure(
+            bg=c["log_background_color"], fg=c["log_text_color"], insertbackground=c["log_text_color"],
+        )
+
     # ------------------------------------------------------------ Actions ----
 
     def _append_log(self, msg: str):
@@ -688,6 +960,18 @@ class RapidGUI(tk.Tk):
         self.log_text.insert("end", msg + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+        try:
+            self.log.info(msg)
+        except Exception:
+            pass
+
+    def _queue_log(self, msg: str, level: int = logging.INFO) -> None:
+        """Enqueue to GUI and write to file immediately — use instead of log_q.put()."""
+        try:
+            self.log.log(level, msg)
+        except Exception:
+            pass
+        self.log_q.put(msg)
 
     def _on_browse(self):
         path = filedialog.asksaveasfilename(initialfile=self.filename_var.get() or "download")
@@ -755,9 +1039,31 @@ class RapidGUI(tk.Tk):
             if not messagebox.askyesno(self.tr.t("confirm_close_title"), self.tr.t("confirm_close_msg")):
                 return
             self.stop_event.set()
+        try:
+            self.log.info("RAPID closed by user")
+            for h in self.log.handlers:
+                try:
+                    h.flush()
+                    if hasattr(h, "stream") and hasattr(h.stream, "fileno"):
+                        os.fsync(h.stream.fileno())
+                except Exception:
+                    pass
+        except Exception:
+            pass
         self.destroy()
 
     def _open_log(self):
+        try:
+            LOG_FILE.touch(exist_ok=True)
+            for h in self.log.handlers:
+                try:
+                    h.flush()
+                    if hasattr(h, "stream") and hasattr(h.stream, "fileno"):
+                        os.fsync(h.stream.fileno())
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             if sys.platform.startswith("win"):
                 os.startfile(LOG_FILE)  # type: ignore[attr-defined]

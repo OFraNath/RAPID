@@ -1,0 +1,19 @@
+{
+    "_meta_name": "Light",
+
+    "background_color":        "#f0f0f0",
+    "text_color":               "#000000",
+    "secondary_text_color":     "#555555",
+    "border_color":             "#b5b5b5",
+
+    "button_background_color":  "#e6e6e6",
+    "button_text_color":        "#000000",
+
+    "input_background_color":   "#ffffff",
+    "input_text_color":         "#000000",
+
+    "accent_color":             "#3a7bd5",
+
+    "log_background_color":     "#111111",
+    "log_text_color":           "#dddddd"
+}

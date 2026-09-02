@@ -1,0 +1,19 @@
+{
+    "_meta_name": "Dark",
+
+    "background_color":        "#1e1e1e",
+    "text_color":               "#e0e0e0",
+    "secondary_text_color":     "#9a9a9a",
+    "border_color":             "#3f3f3f",
+
+    "button_background_color":  "#2d2d2d",
+    "button_text_color":        "#e0e0e0",
+
+    "input_background_color":   "#252525",
+    "input_text_color":         "#e0e0e0",
+
+    "accent_color":             "#3a7bd5",
+
+    "log_background_color":     "#111111",
+    "log_text_color":           "#dddddd"
+}
