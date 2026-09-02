@@ -5,7 +5,6 @@ Parallel download tool for everyday and professional use.
 Usage:
     python RAPID.py                          # interactive mode (TUI)
     python RAPID.py <url> [options]          # direct CLI mode
-    python RAPID.py --batch urls.txt         # URL batch
 
 Dependencies:
     pip install requests rich urllib3
@@ -14,16 +13,13 @@ Dependencies:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
-import os
 import queue
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
@@ -44,8 +40,6 @@ from rich.progress import (
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
-from rich.table import Table
-from rich import box
 from rich.prompt import Prompt, IntPrompt
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,7 +56,6 @@ CONNECT_TIMEOUT = 15
 READ_TIMEOUT    = 45
 WRITE_BUF_SIZE  = 4  * 1024 * 1024   # 4 MB write buffer
 LOG_FILE        = Path.home() / ".rapid" / "rapid.log"
-HISTORY_FILE    = Path.home() / ".rapid" / "history.json"
 
 console = Console()
 
@@ -312,66 +305,6 @@ def worker(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# History
-# ─────────────────────────────────────────────────────────────────────────────
-
-def append_history(url: str, file_name: str, size_bytes: int, duration_s: float) -> None:
-    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    history = []
-    if HISTORY_FILE.exists():
-        try:
-            with open(HISTORY_FILE, encoding="utf-8") as f:
-                history = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            history = []
-
-    history.append({
-        "timestamp":  datetime.now().isoformat(),
-        "url":        url,
-        "file":       file_name,
-        "size_mb":    round(size_bytes / 1e6, 2),
-        "duration_s": round(duration_s, 1),
-        "avg_mbps":   round(size_bytes / 1e6 / duration_s, 2) if duration_s > 0 else 0,
-    })
-    history = history[-200:]
-    try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2, ensure_ascii=False)
-    except OSError:
-        pass
-
-
-def show_history() -> None:
-    if not HISTORY_FILE.exists():
-        console.print("[yellow]No history found.[/yellow]")
-        return
-    try:
-        with open(HISTORY_FILE, encoding="utf-8") as f:
-            history = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        console.print("[red]Error reading history.[/red]")
-        return
-
-    table = Table(title="Download History", box=box.SIMPLE_HEAVY,
-                  show_lines=True, expand=True)
-    table.add_column("Date",    style="dim",  no_wrap=True)
-    table.add_column("File",    style="bold", no_wrap=False)
-    table.add_column("MB",      justify="right")
-    table.add_column("MB/s",    justify="right", style="green")
-    table.add_column("Duration", justify="right")
-
-    for entry in reversed(history[-30:]):
-        table.add_row(
-            entry["timestamp"][:19].replace("T", " "),
-            entry["file"],
-            str(entry["size_mb"]),
-            str(entry["avg_mbps"]),
-            f"{entry['duration_s']}s",
-        )
-    console.print(table)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Main orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -488,8 +421,6 @@ def run_download(
     elapsed   = time.monotonic() - start_time
     avg_speed = info.total_bytes / elapsed / 1e6 if elapsed > 0 else 0
 
-    append_history(url, file_name, info.total_bytes, elapsed)
-
     console.print(
         f"\n[bold green]✓ Download complete![/bold green]\n"
         f"  File   : [bold]{file_name}[/bold]\n"
@@ -499,34 +430,6 @@ def run_download(
     )
     log.info(f"Completed: {file_name} | {avg_speed:.2f} MB/s | {elapsed:.1f}s")
     return True
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Batch mode
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_batch(batch_file: str, n_workers: int, log: logging.Logger) -> None:
-    try:
-        lines = Path(batch_file).read_text(encoding="utf-8").splitlines()
-    except OSError as e:
-        console.print(f"[red]Error reading batch file: {e}[/red]")
-        return
-
-    urls = [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
-    if not urls:
-        console.print("[yellow]No URLs found.[/yellow]")
-        return
-
-    console.print(f"[bold]{len(urls)} URL(s) in queue.[/bold]\n")
-    ok = 0
-    for i, url in enumerate(urls, 1):
-        console.rule(f"[bold]{i}/{len(urls)}[/bold]")
-        name = unquote(Path(urlparse(url).path).name) or f"download_{i}"
-        if run_download(url=url, file_name=name, n_workers=n_workers, log=log):
-            ok += 1
-
-    console.rule()
-    console.print(f"\n[bold]Batch complete:[/bold] {ok}/{len(urls)} succeeded.\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -546,23 +449,13 @@ def interactive_mode(log: logging.Logger) -> None:
         console.print(
             "\n[bold]What do you want to do?[/bold]\n"
             "  [cyan]1[/cyan]  Download a file\n"
-            "  [cyan]2[/cyan]  Download queue (URL file)\n"
-            "  [cyan]3[/cyan]  View history\n"
-            "  [cyan]4[/cyan]  Exit\n"
+            "  [cyan]2[/cyan]  Exit\n"
         )
-        choice = Prompt.ask("Option", choices=["1", "2", "3", "4"], default="1")
+        choice = Prompt.ask("Option", choices=["1", "2"], default="1")
 
-        if choice == "4":
+        if choice == "2":
             console.print("[dim]Goodbye.[/dim]")
             break
-
-        elif choice == "3":
-            show_history()
-
-        elif choice == "2":
-            batch_file = Prompt.ask("Path to the URL file")
-            n = IntPrompt.ask(f"Parallel workers (1–{MAX_WORKERS})", default=DEFAULT_WORKERS)
-            run_batch(batch_file, max(1, min(n, MAX_WORKERS)), log)
 
         elif choice == "1":
             url = Prompt.ask("URL").strip()
@@ -597,16 +490,12 @@ examples:
    rapid                                            interactive mode
    rapid https://example.com/file.zip              automatic name
    rapid https://example.com/file.zip -o out.zip -w 24
-   rapid --batch urls.txt -w 16
-   rapid --history
         """,
     )
     p.add_argument("url",             nargs="?",                         help="URL to download")
     p.add_argument("-o", "--output",  metavar="FILE",                    help="Output file name")
     p.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS, metavar="N",
                    help=f"Parallel workers (default: {DEFAULT_WORKERS})")
-    p.add_argument("--batch",         metavar="FILE",                    help="File with URLs (one per line)")
-    p.add_argument("--history",       action="store_true",               help="Show history")
     p.add_argument("--debug",         action="store_true",               help="Verbose logging to terminal")
     return p
 
@@ -615,14 +504,6 @@ def main() -> None:
     parser = build_parser()
     args   = parser.parse_args()
     log    = setup_logging(debug=args.debug)
-
-    if args.history:
-        show_history()
-        return
-
-    if args.batch:
-        run_batch(args.batch, max(1, min(args.workers, MAX_WORKERS)), log)
-        return
 
     if args.url:
         file_name = args.output or unquote(Path(urlparse(args.url).path).name) or "download"
