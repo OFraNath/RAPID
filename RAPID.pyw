@@ -23,7 +23,7 @@ LOG_FILE = BASE_DIR / "rapid.log"
 LANGUAGES_DIR = BASE_DIR / "languages"
 DEFAULT_LANG = "en"
 THEMES_DIR = BASE_DIR / "themes"
-DEFAULT_THEME = "dark"
+DEFAULT_THEME = "ember"
 CONFIG_FILE = BASE_DIR / "config.cfg"
 
 
