@@ -11,9 +11,9 @@ The only thing I can guarantee is that bugs will be fixed. I hope it will be as 
 
 Here's some sample screenshots just to show you what the tool looks like before downloading:
 
-<img width="330" alt="image" src="https://github.com/user-attachments/assets/729cfaba-8292-430f-9e11-385c2afd19a4" />
-<img width="330" alt="image" src="https://github.com/user-attachments/assets/645b0b3a-1e60-464b-a47d-48e589b65be4" />
-<img width="330" alt="image" src="https://github.com/user-attachments/assets/bd4ef946-594d-4091-b51d-a1044b1027ec" />
+<img width="200" alt="image" src="https://github.com/user-attachments/assets/729cfaba-8292-430f-9e11-385c2afd19a4" />
+<img width="200" alt="image" src="https://github.com/user-attachments/assets/645b0b3a-1e60-464b-a47d-48e589b65be4" />
+<img width="200" alt="image" src="https://github.com/user-attachments/assets/bd4ef946-594d-4091-b51d-a1044b1027ec" />
 
 
 Irrelevant note: <b>I hate IDM</b>.
