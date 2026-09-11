@@ -3,3 +3,5 @@ config.cfg
 config.cfg.tmp
 
 __pycache__/
+
+UPDATE.md

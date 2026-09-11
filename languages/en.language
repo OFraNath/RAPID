@@ -50,5 +50,9 @@
     "chunk_connection_error": "[W{worker_id}] chunk {chunk} connection: {error} (attempt {attempt})",
     "chunk_http_error": "[W{worker_id}] chunk {chunk} HTTP {status} (attempt {attempt})",
     "chunk_disk_error": "[W{worker_id}] chunk {chunk} disk error: {error}",
-    "chunk_failed": "[W{worker_id}] chunk {chunk} FAILED after {retries} attempts."
+    "chunk_failed": "[W{worker_id}] chunk {chunk} FAILED after {retries} attempts.",
+    "chunk_html_detected": "[W{worker_id}] chunk {chunk} looks like HTML, not the file (attempt {attempt}) — possible block, captcha or expired link.",
+    "chunk_blocked_detected": "[W{worker_id}] chunk {chunk} blocked by WAF/CDN (HTTP {status}) (attempt {attempt}) — switching strategy before retry.",
+    "retry_round": "Retrying {count} failed chunk(s) — round {round} with alternate strategy…",
+    "flatline_suspect": "✗ Downloaded file looks like an HTML error page, not the expected file — not marking as complete."
 }

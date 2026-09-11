@@ -159,6 +159,7 @@ except Exception:
 _THIRD_PARTY_PACKAGES = {
     "requests": "requests",
     "urllib3":  "urllib3",
+    "curl_cffi": "curl_cffi",
 }
 
 
@@ -230,6 +231,7 @@ _ensure_dependencies()
 import json
 import locale
 import queue
+import random
 import threading
 import time
 import tkinter as tk
@@ -319,6 +321,111 @@ MAX_RETRIES     = 3
 CONNECT_TIMEOUT = 15
 READ_TIMEOUT    = 45
 WRITE_BUF_SIZE  = 4  * 1024 * 1024
+# Phase 1 (validation) / Phase 2 (WAF) / Phase 3 (retry rounds) / Phase 4 (TLS)
+SNIFF_SIZE       = 512
+PROBE_RANGE_SIZE = 1023
+PROBE_SMALL_SIZE = 1023
+FLATLINE_MIN_BYTES = 10 * 1024
+MAX_ROUNDS       = 3
+UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+]
+HTML_MARKERS = (b"<!doctype", b"<html", b"<head", b"<script")
+WAF_BODY_MARKERS = (
+    b"checking your browser", b"challenge-platform", b"captcha",
+    b"cf-challenge", b"just a moment", b"attention required",
+    b"access denied", b"cloudflare ray", b"verify you are human",
+)
+CHALLENGE_DOMAINS = (
+    "challenges.cloudflare.com", "accounts.google.com",
+    "www.google.com/recaptcha", "/cdn-cgi/challenge",
+)
+BINARY_EXTS = frozenset({
+    ".mp4", ".mkv", ".avi", ".mov", ".iso", ".zip", ".rar", ".7z",
+    ".exe", ".msi", ".mp3", ".flac", ".pdf", ".tar", ".gz", ".bin",
+})
+
+# Phase 1.1 (extended) — magic-byte signature table.
+# Each entry: family -> list of (offset, signature_bytes). Family groups
+# related extensions so a mismatch check can compare "detected family" vs
+# "extension family" without needing an exact 1:1 extension match
+# (e.g. .mp4/.mov/.m4a/.m4v all share the ISO-BMFF "ftyp" box format).
+MAGIC_SIGNATURES: dict[str, list[tuple[int, bytes]]] = {
+    # documents
+    "pdf":   [(0, b"%PDF-")],
+    "rtf":   [(0, b"{\\rtf1")],
+    "ole":   [(0, b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")],  # legacy .doc/.xls/.ppt/.msi
+    # archives / containers
+    "zip":   [(0, b"PK\x03\x04"), (0, b"PK\x05\x06"), (0, b"PK\x07\x08")],  # also .docx/.xlsx/.pptx/.apk/.jar
+    "rar":   [(0, b"Rar!\x1a\x07\x00"), (0, b"Rar!\x1a\x07\x01\x00")],
+    "7z":    [(0, b"7z\xbc\xaf\x27\x1c")],
+    "gzip":  [(0, b"\x1f\x8b")],
+    "bzip2": [(0, b"BZh")],
+    "xz":    [(0, b"\xfd7zXZ\x00")],
+    "zstd":  [(0, b"\x28\xb5\x2f\xfd")],
+    "tar":   [(257, b"ustar")],
+    "iso":   [(0x8001, b"CD001"), (0x8801, b"CD001"), (0x9001, b"CD001")],
+    "cab":   [(0, b"MSCF")],
+    # executables
+    "exe":   [(0, b"MZ")],           # PE/COFF (.exe/.dll/.msi-stub)
+    "elf":   [(0, b"\x7fELF")],
+    "macho": [(0, b"\xfe\xed\xfa\xce"), (0, b"\xfe\xed\xfa\xcf"),
+              (0, b"\xca\xfe\xba\xbe")],
+    # audio
+    "mp3":   [(0, b"ID3"), (0, b"\xff\xfb"), (0, b"\xff\xf3"), (0, b"\xff\xf2")],
+    "flac":  [(0, b"fLaC")],
+    "wav":   [(0, b"RIFF")],  # container also used by AVI/WEBP; refined via subtype in sniff
+    "ogg":   [(0, b"OggS")],
+    "midi":  [(0, b"MThd")],
+    "ape":   [(0, b"MAC ")],
+    # video
+    "ftyp":  [(4, b"ftyp")],  # mp4/mov/m4a/m4v/3gp — ISO-BMFF family
+    "mkv":   [(0, b"\x1a\x45\xdf\xa3")],  # also .webm
+    "avi":   [(0, b"RIFF")],  # refined below (AVI subtype at offset 8)
+    "wmv":   [(0, b"\x30\x26\xb2\x75\x8e\x66\xcf\x11")],  # ASF container (.wmv/.wma)
+    "flv":   [(0, b"FLV\x01")],
+    # images
+    "png":   [(0, b"\x89PNG\r\n\x1a\n")],
+    "jpg":   [(0, b"\xff\xd8\xff")],
+    "gif":   [(0, b"GIF87a"), (0, b"GIF89a")],
+    "bmp":   [(0, b"BM")],
+    "webp":  [(0, b"RIFF")],  # refined below (WEBP subtype at offset 8)
+    "ico":   [(0, b"\x00\x00\x01\x00")],
+    "heic":  [(4, b"ftypheic"), (4, b"ftypheix"), (4, b"ftypmif1")],
+    "tiff":  [(0, b"II*\x00"), (0, b"MM\x00*")],
+    # fonts
+    "ttf":   [(0, b"\x00\x01\x00\x00"), (0, b"true")],
+    "otf":   [(0, b"OTTO")],
+    "woff":  [(0, b"wOFF")],
+    "woff2": [(0, b"wOF2")],
+}
+# RIFF sub-family disambiguation (offset 8, 4 bytes) — WAV/AVI/WEBP all start "RIFF".
+_RIFF_SUBTYPES = {b"WAVE": "wav", b"AVI ": "avi", b"WEBP": "webp"}
+# Extension -> "family" so extension vs. sniffed-format comparisons don't
+# false-positive on same-family variants (e.g. .m4a is audio in an ftyp box).
+_EXT_FAMILY = {
+    ".pdf": {"pdf"}, ".rtf": {"rtf"},
+    ".doc": {"ole"}, ".xls": {"ole"}, ".ppt": {"ole"}, ".msi": {"ole", "exe"},
+    ".zip": {"zip"}, ".docx": {"zip"}, ".xlsx": {"zip"}, ".pptx": {"zip"},
+    ".apk": {"zip"}, ".jar": {"zip"},
+    ".rar": {"rar"}, ".7z": {"7z"}, ".gz": {"gzip"}, ".tgz": {"gzip"},
+    ".bz2": {"bzip2"}, ".xz": {"xz"}, ".zst": {"zstd"}, ".tar": {"tar"},
+    ".iso": {"iso"}, ".cab": {"cab"},
+    ".exe": {"exe"}, ".dll": {"exe"}, ".elf": {"elf"}, ".bin": {"exe", "elf"},
+    ".mp3": {"mp3"}, ".flac": {"flac"}, ".wav": {"wav"}, ".ogg": {"ogg"},
+    ".mid": {"midi"}, ".ape": {"ape"},
+    ".mp4": {"ftyp"}, ".m4a": {"ftyp"}, ".m4v": {"ftyp"}, ".mov": {"ftyp"},
+    ".3gp": {"ftyp"}, ".heic": {"ftyp", "heic"},
+    ".mkv": {"mkv"}, ".webm": {"mkv"}, ".avi": {"avi"},
+    ".wmv": {"wmv"}, ".wma": {"wmv"}, ".flv": {"flv"},
+    ".png": {"png"}, ".jpg": {"jpg"}, ".jpeg": {"jpg"}, ".gif": {"gif"},
+    ".bmp": {"bmp"}, ".webp": {"webp"}, ".ico": {"ico"}, ".tif": {"tiff"},
+    ".tiff": {"tiff"}, ".ttf": {"ttf"}, ".otf": {"otf"},
+    ".woff": {"woff"}, ".woff2": {"woff2"},
+}
 
 
 
@@ -716,7 +823,158 @@ class ServerInfo:
     content_type:   str
 
 
-def make_session() -> requests.Session:
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 — content validation (inline, no new module) +
+# Phase 2 — WAF/CDN block detection (inline)
+# Best-effort: never crash the download because of validation itself.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def looks_like_html(data: bytes) -> bool:
+    try:
+        head = data[:SNIFF_SIZE].lstrip()[:512].lower()
+    except Exception:
+        return False
+    return any(m in head for m in HTML_MARKERS)
+
+
+def _expected_binary(content_type: str, filename: str) -> bool:
+    ct = (content_type or "").lower()
+    if "html" in ct:
+        return False
+    ext = "." + (filename.rsplit(".", 1)[-1].lower() if "." in filename else "")
+    if ext in BINARY_EXTS:
+        return True
+    # application/octet-stream, video/*, audio/*, image/* (except svg), zip-like, pdf, iso
+    if ct.startswith(("video/", "audio/")):
+        return True
+    if ct in ("application/octet-stream", "application/pdf",
+              "application/zip", "application/x-iso9660-image",
+              "application/x-msdownload"):
+        return True
+    if ct.startswith("application/") and "json" not in ct and "xml" not in ct and "text" not in ct:
+        return True
+    return False
+
+
+def sniff_format(data: bytes) -> Optional[str]:
+    """Best-effort magic-byte sniff. Returns a family name from
+    MAGIC_SIGNATURES (e.g. 'zip', 'ftyp', 'png') or None if nothing matched.
+    Never raises — a sniff failure just means 'unknown', not 'html'."""
+    try:
+        if not data:
+            return None
+        for family, sigs in MAGIC_SIGNATURES.items():
+            for offset, sig in sigs:
+                if len(data) >= offset + len(sig) and data[offset:offset + len(sig)] == sig:
+                    if family in ("wav", "avi", "webp"):
+                        sub = data[8:12]
+                        resolved = _RIFF_SUBTYPES.get(sub)
+                        if resolved:
+                            return resolved
+                        continue  # RIFF but unknown subtype: don't claim a false family
+                    return family
+        return None
+    except Exception:
+        return None
+
+
+def magic_mismatch(data: bytes, filename: str, content_type: str) -> Optional[str]:
+    """Phase 1.1 (extended) — compare sniffed magic bytes against what the
+    extension/content-type promised. Returns a human-readable reason string
+    if there's a confident contradiction, or None if OK / inconclusive.
+
+    Deliberately conservative: only fires when we positively identified a
+    *different* known binary family than the one implied by the filename —
+    an unmatched/unknown sniff is never treated as a mismatch, since many
+    legitimate files won't hit any signature in the table.
+    """
+    try:
+        ext = "." + (filename.rsplit(".", 1)[-1].lower() if "." in filename else "")
+        expected_families = _EXT_FAMILY.get(ext)
+        if not expected_families:
+            return None  # unknown extension: nothing to compare against
+        detected = sniff_format(data)
+        if detected is None:
+            return None  # inconclusive: don't flag on lack of a match
+        if detected in expected_families:
+            return None
+        return f"expected '{ext}' ({'/'.join(sorted(expected_families))}) but content sniffs as '{detected}'"
+    except Exception:
+        return None
+
+
+def _body_indicates_block(peek: bytes) -> bool:
+    try:
+        low = peek[:4096].lower()
+    except Exception:
+        return False
+    return any(m in low for m in WAF_BODY_MARKERS)
+
+
+def is_block_response(resp, peek: bytes | None = None) -> tuple[bool, str]:
+    """Classify a response as WAF/CDN challenge vs. plain HTTP. Returns (blocked, reason)."""
+    try:
+        headers = {str(k).lower(): str(v) for k, v in dict(getattr(resp, "headers", {}) or {}).items()}
+    except Exception:
+        headers = {}
+    try:
+        final_url = str(getattr(resp, "url", "") or "").lower()
+    except Exception:
+        final_url = ""
+    if "cf-mitigated" in headers:
+        return True, "cf-mitigated header"
+    if any(k.startswith("cf-chl-") for k in headers):
+        return True, "cloudflare challenge header"
+    if any(k.startswith("x-akamai-") and "bot" in str(v).lower() for k, v in headers.items()):
+        return True, "akamai bot header"
+    if any(d in final_url for d in CHALLENGE_DOMAINS):
+        return True, f"redirect to challenge ({final_url[:80]})"
+    body = peek if peek is not None else b""
+    if body and _body_indicates_block(body):
+        return True, "challenge marker in body"
+    return False, ""
+
+
+def pick_ua(attempt: int, blocked: bool) -> str:
+    if not blocked:
+        return "Reliable Asynchronous Parallel Internet Downloader"
+    try:
+        return UA_POOL[(max(1, attempt) - 1) % len(UA_POOL)]
+    except Exception:
+        return UA_POOL[0]
+
+
+def make_session():
+    """Phase 4 — prefer curl_cffi (browser TLS fingerprint), fallback to requests.
+
+    Keeps the requests-compatible surface used by worker()/inspect_url():
+    .get/.head(stream/timeout/headers), .headers, resp.(status_code/headers/url/
+    iter_content/raise_for_status).
+    """
+    try:
+        if importlib.util.find_spec("curl_cffi") is not None:
+            from curl_cffi import requests as curl_requests  # type: ignore
+            try:
+                session = curl_requests.Session(impersonate="chrome124")
+            except TypeError:
+                session = curl_requests.Session()
+            try:
+                session.headers.update({
+                    "Accept-Encoding": "identity",
+                    "Connection":      "keep-alive",
+                })
+            except Exception:
+                pass
+            try:
+                _EARLY_LOG.info("HTTP backend: curl_cffi (chrome124 impersonation)")
+            except Exception:
+                pass
+            return session
+    except Exception as e:
+        try:
+            _EARLY_LOG.warning(f"curl_cffi unavailable, falling back to requests ({e})")
+        except Exception:
+            pass
     session = requests.Session()
     retry = Retry(
         total=MAX_RETRIES,
@@ -741,7 +999,7 @@ def make_session() -> requests.Session:
     return session
 
 
-def inspect_url(session: requests.Session, url: str, log: logging.Logger) -> ServerInfo:
+def inspect_url(session, url: str, log: logging.Logger) -> ServerInfo:
     resp = session.head(url, timeout=(CONNECT_TIMEOUT, 15), allow_redirects=True)
     resp.raise_for_status()
 
@@ -768,15 +1026,82 @@ def inspect_url(session: requests.Session, url: str, log: logging.Logger) -> Ser
             except Exception:
                 name = ""
     if not name:
-        name = unquote(Path(urlparse(resp.url).path).name) or "download"
+        try:
+            final_u = getattr(resp, "url", url)
+        except Exception:
+            final_u = url
+        name = unquote(Path(urlparse(final_u).path).name) or "download"
 
     log.info(f"HEAD {url} -> {total/1e6:.2f} MB | Range={accepts} | type={ctype}")
+
+    # Phase 1.2 — HEAD lies: probe first KB with a real Range GET and validate.
+    # Phase 2 — classify WAF/CDN challenge here, not as a generic network error.
+    try:
+        probe = session.get(
+            url, headers={"Range": f"bytes=0-{PROBE_RANGE_SIZE}"},
+            stream=False, timeout=(CONNECT_TIMEOUT, 15), allow_redirects=True,
+        )
+        try:
+            peek = bytes(getattr(probe, "content", b"") or b"")[:4096]
+        except Exception:
+            peek = b""
+        blocked, reason = is_block_response(probe, peek)
+        if blocked:
+            log.warning(f"inspect probe: block/challenge detected ({reason}) — not starting blind download")
+            raise RuntimeError(
+                "Server returned a block/challenge page instead of the file "
+                f"(possible WAF/CDN protection: {reason}). "
+                "Try a warmed session/referer page or retry later."
+            )
+        probe_ctype = ""
+        try:
+            probe_ctype = str(probe.headers.get("Content-Type", ctype))
+        except Exception:
+            probe_ctype = ctype
+        final_name = name
+        try:
+            final_u2 = str(getattr(probe, "url", "") or "")
+            if final_u2:
+                cand = unquote(Path(urlparse(final_u2).path).name)
+                if cand:
+                    final_name = cand
+        except Exception:
+            pass
+        if peek and looks_like_html(peek) and _expected_binary(probe_ctype, final_name):
+            log.warning("inspect probe: first bytes look like HTML, not the file — aborting before big download")
+            raise RuntimeError(
+                "Server returned HTML instead of the file "
+                "(possible block, captcha or expired link). "
+                "Not starting the download."
+            )
+        if peek:
+            mismatch = magic_mismatch(peek, final_name, probe_ctype)
+            if mismatch:
+                log.warning(f"inspect probe: magic-byte mismatch — {mismatch}")
+                raise RuntimeError(
+                    f"Server response does not match the expected file type ({mismatch}). "
+                    "Not starting the download."
+                )
+    except RuntimeError:
+        raise
+    except Exception as e:
+        # Probe is best-effort: a probe failure must not mask a good HEAD.
+        log.debug(f"inspect probe skipped/failed ({e}), trusting HEAD")
+
     return ServerInfo(total_bytes=total, accepts_range=accepts,
                        suggested_name=name, content_type=ctype)
 
 
-def _backoff(attempt: int) -> None:
-    time.sleep(min(2 ** (attempt - 1), 30))
+def _backoff(attempt: int, blocked: bool = False) -> None:
+    # Phase 3 — exponential backoff with ±30% jitter; blocked retries wait a bit longer.
+    base = min(2 ** (max(1, attempt) - 1), 30)
+    if blocked:
+        base = min(base * 1.5, 30)
+    try:
+        delay = base * (0.7 + random.random() * 0.6)
+    except Exception:
+        delay = float(base)
+    time.sleep(delay)
 
 
 def worker(
@@ -798,6 +1123,8 @@ def worker(
             return
 
         success = False
+        last_blocked = False
+        last_html = False
 
         for attempt in range(1, MAX_RETRIES + 1):
             if stop_event.is_set():
@@ -810,7 +1137,72 @@ def worker(
                 success = True
                 break
 
+            # Phase 3 — on retry after block/HTML, probe 1KB first with rotated UA
+            # before committing the whole chunk again.
+            if attempt > 1 and (last_blocked or last_html):
+                try:
+                    probe_end = min(start + PROBE_SMALL_SIZE, chunk.end)
+                    probe_resp = session.get(
+                        state.url,
+                        headers={
+                            "Range": f"bytes={start}-{probe_end}",
+                            "User-Agent": pick_ua(attempt, True),
+                        },
+                        stream=False,
+                        timeout=(CONNECT_TIMEOUT, 15),
+                        allow_redirects=True,
+                    )
+                    try:
+                        probe_peek = bytes(getattr(probe_resp, "content", b"") or b"")[:4096]
+                    except Exception:
+                        probe_peek = b""
+                    p_blocked, p_reason = is_block_response(probe_resp, probe_peek)
+                    try:
+                        probe_resp.close()
+                    except Exception:
+                        pass
+                    if p_blocked:
+                        log.warning(tr.t(
+                            "chunk_blocked_detected",
+                            worker_id=f"{worker_id:02d}", chunk=chunk.index,
+                            status=getattr(probe_resp, "status_code", "?"), attempt=attempt,
+                        ))
+                        last_blocked = True
+                        last_html = False
+                        if attempt < MAX_RETRIES:
+                            _backoff(attempt, blocked=True)
+                        continue
+                    try:
+                        pct = str(probe_resp.headers.get("Content-Type", ""))
+                    except Exception:
+                        pct = ""
+                    if probe_peek and looks_like_html(probe_peek) and _expected_binary(pct, state.file_name):
+                        log.warning(tr.t(
+                            "chunk_html_detected",
+                            worker_id=f"{worker_id:02d}", chunk=chunk.index, attempt=attempt,
+                        ))
+                        last_blocked = False
+                        last_html = True
+                        if attempt < MAX_RETRIES:
+                            _backoff(attempt, blocked=True)
+                        continue
+                    if probe_peek and chunk.start == 0:
+                        mismatch0 = magic_mismatch(probe_peek, state.file_name, pct)
+                        if mismatch0:
+                            log.warning(f"[W{worker_id:02d}] chunk {chunk.index} magic-byte mismatch — {mismatch0}")
+                            last_blocked = False
+                            last_html = True
+                            if attempt < MAX_RETRIES:
+                                _backoff(attempt, blocked=True)
+                            continue
+                except Exception as e:
+                    log.debug(f"[W{worker_id:02d}] chunk {chunk.index} small-probe failed ({e}), retrying full range")
+                last_blocked = False
+                last_html = False
+
             headers = {"Range": f"bytes={start}-{chunk.end}"}
+            if last_blocked or (attempt > 1 and last_html):
+                headers["User-Agent"] = pick_ua(attempt, True)
             try:
                 resp = session.get(
                     state.url,
@@ -831,9 +1223,15 @@ def worker(
                     start = chunk.start
                     chunk.bytes_done = 0
 
+                try:
+                    resp_ctype = str(resp.headers.get("Content-Type", ""))
+                except Exception:
+                    resp_ctype = ""
                 write_pos = start
                 buf = bytearray()
                 interrupted = False
+                poisoned = False
+                first = True
 
                 for data in resp.iter_content(chunk_size=CHUNK_SIZE):
                     if stop_event.is_set():
@@ -841,6 +1239,41 @@ def worker(
                         break
                     if not data:
                         continue
+                    # Phase 1+2 — inspect first bytes before trusting the stream.
+                    if first:
+                        first = False
+                        try:
+                            peek0 = bytes(data[:4096])
+                        except Exception:
+                            peek0 = b""
+                        blocked0, reason0 = is_block_response(resp, peek0)
+                        if blocked0:
+                            log.warning(tr.t(
+                                "chunk_blocked_detected",
+                                worker_id=f"{worker_id:02d}", chunk=chunk.index,
+                                status=getattr(resp, "status_code", "?"), attempt=attempt,
+                            ))
+                            last_blocked = True
+                            last_html = False
+                            poisoned = True
+                            break
+                        if peek0 and looks_like_html(peek0) and _expected_binary(resp_ctype, state.file_name):
+                            log.warning(tr.t(
+                                "chunk_html_detected",
+                                worker_id=f"{worker_id:02d}", chunk=chunk.index, attempt=attempt,
+                            ))
+                            last_blocked = False
+                            last_html = True
+                            poisoned = True
+                            break
+                        if peek0 and chunk.start == 0:
+                            mismatch1 = magic_mismatch(peek0, state.file_name, resp_ctype)
+                            if mismatch1:
+                                log.warning(f"[W{worker_id:02d}] chunk {chunk.index} magic-byte mismatch — {mismatch1}")
+                                last_blocked = False
+                                last_html = True
+                                poisoned = True
+                                break
                     buf.extend(data)
                     n = len(data)
                     state.record_bytes(n)
@@ -856,6 +1289,19 @@ def worker(
                         if state_lock is not None:
                             with state_lock:
                                 save_state(state)
+
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
+                if poisoned:
+                    # Don't write partial HTML: roll back byte accounting for this
+                    # attempt (bytes already counted stay counted for progress,
+                    # but chunk position doesn't advance — next attempt re-reads).
+                    if attempt < MAX_RETRIES:
+                        _backoff(attempt, blocked=True)
+                    continue
 
                 if buf:
                     with file_lock:
@@ -876,6 +1322,8 @@ def worker(
                 chunk.done = True
                 chunk.bytes_done = chunk.size
                 success = True
+                last_blocked = False
+                last_html = False
                 log.info(tr.t("chunk_ok", worker_id=f"{worker_id:02d}", chunk=chunk.index, size=f"{chunk.size/1e6:.1f}"))
                 if state_lock is not None:
                     with state_lock:
@@ -884,20 +1332,42 @@ def worker(
 
             except requests.exceptions.Timeout:
                 log.warning(tr.t("chunk_timeout", worker_id=f"{worker_id:02d}", chunk=chunk.index, attempt=attempt))
+                last_blocked = False
             except requests.exceptions.ChunkedEncodingError:
                 log.warning(tr.t("chunk_stream_interrupted", worker_id=f"{worker_id:02d}", chunk=chunk.index, attempt=attempt))
+                last_blocked = False
             except requests.exceptions.ConnectionError as e:
                 log.warning(tr.t("chunk_connection_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, error=e, attempt=attempt))
+                last_blocked = False
             except requests.exceptions.HTTPError as e:
-                status = e.response.status_code if e.response is not None else "?"
-                log.warning(tr.t("chunk_http_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, status=status, attempt=attempt))
+                eresp = getattr(e, "response", None)
+                status = eresp.status_code if eresp is not None and hasattr(eresp, "status_code") else "?"
+                peek_h = b""
+                try:
+                    if eresp is not None:
+                        peek_h = bytes(getattr(eresp, "content", b"") or b"")[:4096]
+                except Exception:
+                    peek_h = b""
+                blocked_h, _r = is_block_response(eresp, peek_h) if eresp is not None else (False, "")
+                if blocked_h or (isinstance(status, int) and status in (403, 429) and peek_h and _body_indicates_block(peek_h)):
+                    log.warning(tr.t("chunk_blocked_detected", worker_id=f"{worker_id:02d}", chunk=chunk.index, status=status, attempt=attempt))
+                    last_blocked = True
+                else:
+                    log.warning(tr.t("chunk_http_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, status=status, attempt=attempt))
+                    last_blocked = False
             except OSError as e:
                 log.error(tr.t("chunk_disk_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, error=e))
                 chunk_q.task_done()
                 return
+            except Exception as e:
+                # curl_cffi backend (or anything else): classify generically.
+                status_x = getattr(getattr(e, "response", None), "status_code", "?")
+                log.warning(tr.t("chunk_connection_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, error=e, attempt=attempt))
+                last_blocked = ("block" in str(e).lower() or "challenge" in str(e).lower()
+                                or "captcha" in str(e).lower())
 
             if attempt < MAX_RETRIES:
-                _backoff(attempt)
+                _backoff(attempt, blocked=last_blocked)
 
         if not success:
             log.error(tr.t("chunk_failed", worker_id=f"{worker_id:02d}", chunk=chunk.index, retries=MAX_RETRIES))
@@ -1902,25 +2372,47 @@ class RapidGUI(tk.Tk):
 
         file_lock = threading.Lock()
         state_lock = threading.Lock()
-        chunk_q: "queue.Queue[Chunk]" = queue.Queue()
-        pending = [c for c in chunks if not c.done]
-        for c in pending:
-            chunk_q.put(c)
 
-        n_active = max(1, min(n_workers, len(pending)))
-        with ThreadPoolExecutor(max_workers=n_active) as executor:
-            futures = [
-                executor.submit(
-                    worker, i, session, self.state, chunk_q, file_lock, self.log, self.stop_event,
-                    self.log_q, self.tr, state_lock,
-                )
-                for i in range(n_active)
-            ]
-            for f in as_completed(futures):
+        # Phase 3.1 — retry in rounds: first drain first-tries, then re-attack
+        # only the chunks that really failed, with alternate strategy (rotated UA).
+        round_no = 0
+        while round_no < MAX_ROUNDS:
+            round_no += 1
+            pending = [c for c in self.state.chunks if not c.done]
+            if not pending:
+                break
+            if round_no > 1:
+                self.log.warning(self.tr.t(
+                    "retry_round", round=round_no, count=len(pending),
+                ))
                 try:
-                    f.result()
-                except Exception as e:
-                    self.log.error(self.tr.t("worker_finished_error", error=e))
+                    session.headers.update({"User-Agent": pick_ua(round_no, True)})
+                except Exception:
+                    pass
+            chunk_q: "queue.Queue[Chunk]" = queue.Queue()
+            for c in pending:
+                chunk_q.put(c)
+            n_active = max(1, min(n_workers, len(pending)))
+            with ThreadPoolExecutor(max_workers=n_active) as executor:
+                futures = [
+                    executor.submit(
+                        worker, i, session, self.state, chunk_q, file_lock, self.log, self.stop_event,
+                        self.log_q, self.tr, state_lock,
+                    )
+                    for i in range(n_active)
+                ]
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        self.log.error(self.tr.t("worker_finished_error", error=e))
+            if self.stop_event.is_set():
+                break
+            remaining = [c for c in self.state.chunks if not c.done]
+            if not remaining:
+                break
+            if round_no >= MAX_ROUNDS:
+                break
 
         if self.stop_event.is_set():
             save_state(self.state)
@@ -1934,6 +2426,27 @@ class RapidGUI(tk.Tk):
             self.log.warning(self.tr.t("chunks_incomplete", count=len(failed), list=failed[:10]))
             self._finish(success=False)
             return
+
+        # Phase 1.3 — flatline sanity: never mark HTML-as-file as done.
+        try:
+            if _expected_binary(info.content_type, file_name):
+                with open(file_name, "rb") as f:
+                    head_final = f.read(SNIFF_SIZE)
+                suspicious_size = (
+                    info.total_bytes > 0
+                    and Path(file_name).stat().st_size < FLATLINE_MIN_BYTES
+                    and info.total_bytes > 1024 * 1024
+                )
+                mismatch_final = magic_mismatch(head_final, file_name, info.content_type) if head_final else None
+                if (head_final and looks_like_html(head_final)) or suspicious_size or mismatch_final:
+                    if mismatch_final:
+                        self.log.error(f"flatline check: {mismatch_final}")
+                    self.log.error(self.tr.t("flatline_suspect"))
+                    save_state(self.state)
+                    self._finish(success=False)
+                    return
+        except Exception as e:
+            self.log.debug(f"flatline check skipped ({e})")
 
         clear_state(file_name)
         elapsed = time.monotonic() - self.start_time

@@ -50,5 +50,9 @@
     "chunk_connection_error": "[W{worker_id}] pedaço {chunk} conexão: {error} (tentativa {attempt})",
     "chunk_http_error": "[W{worker_id}] pedaço {chunk} HTTP {status} (tentativa {attempt})",
     "chunk_disk_error": "[W{worker_id}] pedaço {chunk} erro de disco: {error}",
-    "chunk_failed": "[W{worker_id}] pedaço {chunk} FALHOU após {retries} tentativas."
+    "chunk_failed": "[W{worker_id}] pedaço {chunk} FALHOU após {retries} tentativas.",
+    "chunk_html_detected": "[W{worker_id}] pedaço {chunk} parece HTML, não o arquivo (tentativa {attempt}) — possível bloqueio, captcha ou link expirado.",
+    "chunk_blocked_detected": "[W{worker_id}] pedaço {chunk} bloqueado por WAF/CDN (HTTP {status}) (tentativa {attempt}) — trocando de estratégia antes de repetir.",
+    "retry_round": "Tentando de novo {count} pedaço(s) que falharam — rodada {round} com estratégia alternativa…",
+    "flatline_suspect": "✗ Arquivo baixado parece uma página HTML de erro, não o arquivo esperado — não marcado como concluído."
 }
