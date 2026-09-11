@@ -16,11 +16,18 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 # ─────────────────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 LOG_FILE = BASE_DIR / "rapid.log"
-LANGUAGES_DIR = BASE_DIR / "languages"
+if getattr(sys, "frozen", False):
+    LANGUAGES_DIR = Path(sys._MEIPASS) / "languages"
+    THEMES_DIR = Path(sys._MEIPASS) / "themes"
+else:
+    LANGUAGES_DIR = BASE_DIR / "languages"
+    THEMES_DIR = BASE_DIR / "themes"
 DEFAULT_LANG = "en"
-THEMES_DIR = BASE_DIR / "themes"
 DEFAULT_THEME = "ember"
 CONFIG_FILE = BASE_DIR / "config.cfg"
 

@@ -4,4 +4,9 @@ config.cfg.tmp
 
 __pycache__/
 
+# PyInstaller builds
+dist/
+build/
+*.spec
+
 UPDATE.md
