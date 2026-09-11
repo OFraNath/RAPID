@@ -8,5 +8,6 @@ __pycache__/
 dist/
 build/
 *.spec
+RAPID.exe
 
 UPDATE.md
