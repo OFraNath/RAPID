@@ -244,15 +244,78 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Screen sleep prevention (Phase 0.1) — keep the display/system awake while
+# a download is actively running. Best-effort: any failure is logged and
+# ignored, it must never block or crash a download.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_caffeinate_proc = None  # type: ignore[assignment]
+
+
+def prevent_sleep(log: "logging.Logger") -> None:
+    """Ask the OS not to sleep/turn off the display while downloading."""
+    global _caffeinate_proc
+    try:
+        if sys.platform.startswith("win"):
+            import ctypes
+            ES_CONTINUOUS = 0x80000000
+            ES_SYSTEM_REQUIRED = 0x00000001
+            ES_DISPLAY_REQUIRED = 0x00000002
+            ctypes.windll.kernel32.SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+            )
+        elif sys.platform == "darwin":
+            if _caffeinate_proc is None or _caffeinate_proc.poll() is not None:
+                _caffeinate_proc = subprocess.Popen(
+                    ["caffeinate", "-i"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+        else:
+            try:
+                if _caffeinate_proc is None or _caffeinate_proc.poll() is not None:
+                    _caffeinate_proc = subprocess.Popen(
+                        [
+                            "systemd-inhibit", "--what=idle:sleep",
+                            "--who=RAPID", "--why=Active download in progress",
+                            "sleep", "infinity",
+                        ],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+            except FileNotFoundError:
+                _caffeinate_proc = None
+    except Exception as e:
+        log.debug(f"prevent_sleep: could not inhibit sleep ({e}), continuing without it.")
+
+
+def allow_sleep(log: "logging.Logger") -> None:
+    """Undo prevent_sleep() once a download finishes/cancels/fails."""
+    global _caffeinate_proc
+    try:
+        if sys.platform.startswith("win"):
+            import ctypes
+            ES_CONTINUOUS = 0x80000000
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        else:
+            if _caffeinate_proc is not None:
+                try:
+                    _caffeinate_proc.terminate()
+                except Exception:
+                    pass
+                _caffeinate_proc = None
+    except Exception as e:
+        log.debug(f"allow_sleep: could not release sleep inhibitor ({e}), continuing.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_WORKERS = 16
-MAX_WORKERS     = 32
+MAX_WORKERS     = 64
 CHUNK_SIZE      = 1  * 1024 * 1024
 CHUNK_PART_SIZE = 64 * 1024 * 1024
-MIN_SPLIT_SIZE  = 8  * 1024 * 1024
-MAX_RETRIES     = 6
+MIN_SPLIT_SIZE  = 4  * 1024 * 1024
+MAX_RETRIES     = 3
 CONNECT_TIMEOUT = 15
 READ_TIMEOUT    = 45
 WRITE_BUF_SIZE  = 4  * 1024 * 1024
@@ -854,6 +917,49 @@ def human_size(n: float) -> str:
     return f"{n:.1f} PB"
 
 
+class _Tooltip:
+    """Minimal hover tooltip for a widget (Phase 0.3 — explanatory text)."""
+
+    def __init__(self, widget, text_var):
+        self.widget = widget
+        self.text_var = text_var  # callable returning the current text
+        self.tipwindow = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, _event=None):
+        text = self.text_var() if callable(self.text_var) else self.text_var
+        if not text or self.tipwindow is not None:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+            tw = tk.Toplevel(self.widget)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{x}+{y}")
+            lbl = tk.Label(
+                tw, text=text, justify="left", background="#ffffe0",
+                relief="solid", borderwidth=1, wraplength=340,
+                font=("TkDefaultFont", 8),
+            )
+            lbl.pack(ipadx=4, ipady=2)
+            self.tipwindow = tw
+        except Exception:
+            self.tipwindow = None
+
+    def _hide(self, _event=None):
+        if self.tipwindow is not None:
+            try:
+                self.tipwindow.destroy()
+            except Exception:
+                pass
+            self.tipwindow = None
+
+    def update_text(self):
+        """Call after a language change so a currently-open tooltip refreshes."""
+        self._hide()
+
+
 class RapidGUI(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -965,6 +1071,13 @@ class RapidGUI(tk.Tk):
         self.lbl_url.grid(row=0, column=0, sticky="w", **pad)
         self.url_var = tk.StringVar()
         ttk.Entry(self.frm_top, textvariable=self.url_var, width=64).grid(row=0, column=1, columnspan=3, sticky="we", **pad)
+        # A new/changed URL means the old "Save as" name (auto-filled for the
+        # previous link) no longer applies — track edits so we only clear it
+        # when the name was never actually chosen by the user.
+        self._filename_user_edited = False
+        self._suppress_filename_trace = False
+        self._last_url_for_name = ""
+        self.url_var.trace_add("write", self._on_url_changed)
 
         self.btn_verify = ttk.Button(self.frm_top, text=self.tr.t("verify_btn"), command=self._on_inspect)
         self.btn_verify.grid(row=0, column=4, **pad)
@@ -972,6 +1085,7 @@ class RapidGUI(tk.Tk):
         self.lbl_save_as = ttk.Label(self.frm_top, text=self.tr.t("save_as_label"))
         self.lbl_save_as.grid(row=1, column=0, sticky="w", **pad)
         self.filename_var = tk.StringVar()
+        self.filename_var.trace_add("write", self._on_filename_var_written)
         ttk.Entry(self.frm_top, textvariable=self.filename_var, width=48).grid(row=1, column=1, columnspan=2, sticky="we", **pad)
         self.btn_browse = ttk.Button(self.frm_top, text=self.tr.t("browse_btn"), command=self._on_browse)
         self.btn_browse.grid(row=1, column=3, **pad)
@@ -979,7 +1093,25 @@ class RapidGUI(tk.Tk):
         self.lbl_workers = ttk.Label(self.frm_top, text=self.tr.t("workers_label"))
         self.lbl_workers.grid(row=2, column=0, sticky="w", **pad)
         self.workers_var = tk.IntVar(value=DEFAULT_WORKERS)
-        ttk.Spinbox(self.frm_top, from_=1, to=MAX_WORKERS, textvariable=self.workers_var, width=6).grid(row=2, column=1, sticky="w", **pad)
+        self.spin_workers = ttk.Spinbox(self.frm_top, from_=1, to=MAX_WORKERS, textvariable=self.workers_var, width=6)
+        self.spin_workers.grid(row=2, column=1, sticky="w", **pad)
+        _Tooltip(self.spin_workers, lambda: self.tr.t("workers_help"))
+        _Tooltip(self.lbl_workers, lambda: self.tr.t("workers_help"))
+
+        self.lbl_parts = ttk.Label(self.frm_top, text=self.tr.t("parts_label"))
+        self.lbl_parts.grid(row=3, column=0, sticky="w", **pad)
+        self.parts_var = tk.IntVar(value=0)
+        self.spin_parts = ttk.Spinbox(self.frm_top, from_=0, to=10000, textvariable=self.parts_var, width=6)
+        self.spin_parts.grid(row=3, column=1, sticky="w", **pad)
+        _Tooltip(self.spin_parts, lambda: self.tr.t("parts_help"))
+        _Tooltip(self.lbl_parts, lambda: self.tr.t("parts_help"))
+
+        # Read-only display of the chunk count actually in use — never writes
+        # back into parts_var, so "0 = adaptive" stays adaptive across runs
+        # unless the user explicitly types a number.
+        self.parts_actual_var = tk.StringVar(value="")
+        self.lbl_parts_actual = ttk.Label(self.frm_top, textvariable=self.parts_actual_var, style="Muted.TLabel")
+        self.lbl_parts_actual.grid(row=3, column=2, sticky="w", **pad)
 
         self.info_var = tk.StringVar(value=self.tr.t("info_default"))
         self.lbl_info = ttk.Label(self.frm_top, textvariable=self.info_var, style="Muted.TLabel")
@@ -1082,6 +1214,7 @@ class RapidGUI(tk.Tk):
         self.lbl_save_as.configure(text=self.tr.t("save_as_label"))
         self.btn_browse.configure(text=self.tr.t("browse_btn"))
         self.lbl_workers.configure(text=self.tr.t("workers_label"))
+        self.lbl_parts.configure(text=self.tr.t("parts_label"))
         self.btn_start.configure(text=self.tr.t("download_btn"))
         self.btn_cancel.configure(text=self.tr.t("cancel_btn"))
         self.btn_open_log.configure(text=self.tr.t("open_log_btn"))
@@ -1515,10 +1648,39 @@ class RapidGUI(tk.Tk):
         except Exception:
             pass
 
+    # ── "Save as" auto-naming vs. user's own choice ──
+
+    def _set_filename_auto(self, value: str) -> None:
+        """Programmatic filename update (derived from the URL/server) — never
+        counts as the user having picked their own name."""
+        self._suppress_filename_trace = True
+        try:
+            self.filename_var.set(value)
+        finally:
+            self._suppress_filename_trace = False
+
+    def _on_filename_var_written(self, *_args) -> None:
+        if not self._suppress_filename_trace:
+            self._filename_user_edited = True
+
+    def _on_url_changed(self, *_args) -> None:
+        url = self.url_var.get().strip()
+        if url == self._last_url_for_name:
+            return
+        self._last_url_for_name = url
+        if not self._filename_user_edited:
+            # New link, name was never chosen by the user — reset so the
+            # next Verify/Download re-derives it instead of reusing (and
+            # silently overwriting) the previous download's file.
+            self._set_filename_auto("")
+            self.info = None
+            self.info_var.set(self.tr.t("info_default"))
+
     def _on_browse(self):
         path = filedialog.asksaveasfilename(initialfile=self.filename_var.get() or "download")
         if path:
-            self.filename_var.set(path)
+            self.filename_var.set(path)  # explicit user choice — trace marks it as such
+            self._filename_user_edited = True
 
     def _on_inspect(self):
         url = self.url_var.get().strip()
@@ -1533,8 +1695,8 @@ class RapidGUI(tk.Tk):
                 self.log.error(self.tr.t("error_checking_url", error=e))
                 return
             self.info = info
-            if not self.filename_var.get():
-                self.filename_var.set(info.suggested_name)
+            if not self._filename_user_edited:
+                self._set_filename_auto(info.suggested_name)
             self.info_var.set(self.tr.t(
                 "info_format",
                 size=human_size(info.total_bytes),
@@ -1555,9 +1717,15 @@ class RapidGUI(tk.Tk):
             messagebox.showwarning(self.tr.t("app_title"), self.tr.t("warn_need_url"))
             return
 
-        file_name = self.filename_var.get().strip() or unquote(Path(urlparse(url).path).name) or "download"
-        self.filename_var.set(file_name)
+        raw_filename = self.filename_var.get().strip()
+        auto_name = not self._filename_user_edited
+        file_name = raw_filename or unquote(Path(urlparse(url).path).name) or "download"
+        self._set_filename_auto(file_name)
         n_workers = max(1, min(self.workers_var.get(), MAX_WORKERS))
+        try:
+            n_parts = max(0, int(self.parts_var.get()))
+        except Exception:
+            n_parts = 0
 
         self.stop_event = threading.Event()
         self.running = True
@@ -1565,9 +1733,12 @@ class RapidGUI(tk.Tk):
         self.btn_cancel.configure(state="normal")
         self.progress.configure(value=0)
         self.status_var.set(self.tr.t("status_checking"))
+        self.parts_actual_var.set("")
+
+        prevent_sleep(self.log)
 
         self.download_thread = threading.Thread(
-            target=self._run_download, args=(url, file_name, n_workers), daemon=True
+            target=self._run_download, args=(url, file_name, n_workers, n_parts, auto_name), daemon=True
         )
         self.download_thread.start()
 
@@ -1623,7 +1794,7 @@ class RapidGUI(tk.Tk):
 
     # ── Download core ──
 
-    def _run_download(self, url: str, file_name: str, n_workers: int):
+    def _run_download(self, url: str, file_name: str, n_workers: int, n_parts: int = 0, auto_name: bool = False):
         session = make_session()
         self.start_time = time.monotonic()
 
@@ -1642,12 +1813,32 @@ class RapidGUI(tk.Tk):
             type=info.content_type,
         ))
 
+        # FIX — a direct download (no Verify click, no manual "Save as")
+        # only had the URL's last path segment to name the file. Now that
+        # the HEAD response is in, upgrade to the real server-suggested
+        # name (Content-Disposition) just like Verify already does.
+        if auto_name and info.suggested_name and info.suggested_name != file_name:
+            file_name = info.suggested_name
+            self.after(0, lambda fn=file_name: self._set_filename_auto(fn))
+
         if not info.accepts_range or info.total_bytes < MIN_SPLIT_SIZE:
             fresh_chunks = [Chunk(index=0, start=0, end=max(info.total_bytes - 1, 0))]
+            part_size_used = max(info.total_bytes, 1)
         else:
+            # Phase 0.2 — "Workers" (concurrency) and "Number of parts" (how many
+            # slices the file is cut into) are independent knobs. If the user gave
+            # an explicit part count, derive part_size from it (clamped to a
+            # sensible minimum so a small file doesn't get sliced into thousands
+            # of pointless requests); otherwise fall back to the fixed
+            # CHUNK_PART_SIZE as before.
+            if n_parts and n_parts > 0:
+                part_size_used = max(-(-info.total_bytes // n_parts), MIN_SPLIT_SIZE)  # ceil division
+            else:
+                part_size_used = CHUNK_PART_SIZE
+
             fresh_chunks, offset, idx = [], 0, 0
             while offset < info.total_bytes:
-                end = min(offset + CHUNK_PART_SIZE - 1, info.total_bytes - 1)
+                end = min(offset + part_size_used - 1, info.total_bytes - 1)
                 fresh_chunks.append(Chunk(index=idx, start=offset, end=end))
                 offset = end + 1
                 idx += 1
@@ -1678,6 +1869,9 @@ class RapidGUI(tk.Tk):
             url=url, file_name=file_name, total_bytes=info.total_bytes,
             n_workers=n_workers, chunks=chunks,
         )
+        self.after(0, lambda n=len(chunks): self.parts_actual_var.set(
+            self.tr.t("parts_actual_format", n=n)
+        ))
 
         already_done = sum(c.bytes_done for c in chunks)
         if already_done:
@@ -1703,7 +1897,7 @@ class RapidGUI(tk.Tk):
 
         self.log.info(self.tr.t(
             "starting_download",
-            file=file_name, chunks=len(chunks), mb=CHUNK_PART_SIZE // 1024 // 1024, workers=n_workers,
+            file=file_name, chunks=len(chunks), mb=part_size_used // 1024 // 1024, workers=n_workers,
         ))
 
         file_lock = threading.Lock()
@@ -1751,6 +1945,7 @@ class RapidGUI(tk.Tk):
         self._finish(success=True)
 
     def _finish(self, success: bool):
+        allow_sleep(self.log)
         self.running = False
         self.btn_start.configure(state="normal")
         self.btn_cancel.configure(state="disabled")
@@ -1775,6 +1970,9 @@ class RapidGUI(tk.Tk):
         self.after(delay, self._drain_log_buffer)
 
     def _poll_progress(self):
+        if self.state is not None:
+            n_chunks = len(self.state.chunks)
+            self.parts_actual_var.set(self.tr.t("parts_actual_format", n=n_chunks))
         if self.state is not None and self.info is not None and self.info.total_bytes > 0:
             done = self.state.bytes_downloaded
             total = self.info.total_bytes
