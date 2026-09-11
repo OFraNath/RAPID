@@ -16,8 +16,6 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Early logging — must be FIRST so crashes are captured
-# ─────────────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 LOG_FILE = BASE_DIR / "rapid.log"
 LANGUAGES_DIR = BASE_DIR / "languages"
@@ -153,8 +151,6 @@ except Exception:
     pass
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Self-installing dependencies
-# ─────────────────────────────────────────────────────────────────────────────
 
 _THIRD_PARTY_PACKAGES = {
     "requests": "requests",
@@ -246,10 +242,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Screen sleep prevention (Phase 0.1) — keep the display/system awake while
-# a download is actively running. Best-effort: any failure is logged and
-# ignored, it must never block or crash a download.
-# ─────────────────────────────────────────────────────────────────────────────
 
 _caffeinate_proc = None  # type: ignore[assignment]
 
@@ -321,7 +313,6 @@ MAX_RETRIES     = 3
 CONNECT_TIMEOUT = 15
 READ_TIMEOUT    = 45
 WRITE_BUF_SIZE  = 4  * 1024 * 1024
-# Phase 1 (validation) / Phase 2 (WAF) / Phase 3 (retry rounds) / Phase 4 (TLS)
 SNIFF_SIZE       = 512
 PROBE_RANGE_SIZE = 1023
 PROBE_SMALL_SIZE = 1023
@@ -348,18 +339,11 @@ BINARY_EXTS = frozenset({
     ".exe", ".msi", ".mp3", ".flac", ".pdf", ".tar", ".gz", ".bin",
 })
 
-# Phase 1.1 (extended) — magic-byte signature table.
-# Each entry: family -> list of (offset, signature_bytes). Family groups
-# related extensions so a mismatch check can compare "detected family" vs
-# "extension family" without needing an exact 1:1 extension match
-# (e.g. .mp4/.mov/.m4a/.m4v all share the ISO-BMFF "ftyp" box format).
 MAGIC_SIGNATURES: dict[str, list[tuple[int, bytes]]] = {
-    # documents
     "pdf":   [(0, b"%PDF-")],
     "rtf":   [(0, b"{\\rtf1")],
-    "ole":   [(0, b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")],  # legacy .doc/.xls/.ppt/.msi
-    # archives / containers
-    "zip":   [(0, b"PK\x03\x04"), (0, b"PK\x05\x06"), (0, b"PK\x07\x08")],  # also .docx/.xlsx/.pptx/.apk/.jar
+    "ole":   [(0, b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")],
+    "zip":   [(0, b"PK\x03\x04"), (0, b"PK\x05\x06"), (0, b"PK\x07\x08")],
     "rar":   [(0, b"Rar!\x1a\x07\x00"), (0, b"Rar!\x1a\x07\x01\x00")],
     "7z":    [(0, b"7z\xbc\xaf\x27\x1c")],
     "gzip":  [(0, b"\x1f\x8b")],
@@ -369,43 +353,35 @@ MAGIC_SIGNATURES: dict[str, list[tuple[int, bytes]]] = {
     "tar":   [(257, b"ustar")],
     "iso":   [(0x8001, b"CD001"), (0x8801, b"CD001"), (0x9001, b"CD001")],
     "cab":   [(0, b"MSCF")],
-    # executables
-    "exe":   [(0, b"MZ")],           # PE/COFF (.exe/.dll/.msi-stub)
+    "exe":   [(0, b"MZ")],
     "elf":   [(0, b"\x7fELF")],
     "macho": [(0, b"\xfe\xed\xfa\xce"), (0, b"\xfe\xed\xfa\xcf"),
               (0, b"\xca\xfe\xba\xbe")],
-    # audio
     "mp3":   [(0, b"ID3"), (0, b"\xff\xfb"), (0, b"\xff\xf3"), (0, b"\xff\xf2")],
     "flac":  [(0, b"fLaC")],
-    "wav":   [(0, b"RIFF")],  # container also used by AVI/WEBP; refined via subtype in sniff
+    "wav":   [(0, b"RIFF")],
     "ogg":   [(0, b"OggS")],
     "midi":  [(0, b"MThd")],
     "ape":   [(0, b"MAC ")],
-    # video
-    "ftyp":  [(4, b"ftyp")],  # mp4/mov/m4a/m4v/3gp — ISO-BMFF family
-    "mkv":   [(0, b"\x1a\x45\xdf\xa3")],  # also .webm
-    "avi":   [(0, b"RIFF")],  # refined below (AVI subtype at offset 8)
-    "wmv":   [(0, b"\x30\x26\xb2\x75\x8e\x66\xcf\x11")],  # ASF container (.wmv/.wma)
+    "ftyp":  [(4, b"ftyp")],
+    "mkv":   [(0, b"\x1a\x45\xdf\xa3")],
+    "avi":   [(0, b"RIFF")],
+    "wmv":   [(0, b"\x30\x26\xb2\x75\x8e\x66\xcf\x11")],
     "flv":   [(0, b"FLV\x01")],
-    # images
     "png":   [(0, b"\x89PNG\r\n\x1a\n")],
     "jpg":   [(0, b"\xff\xd8\xff")],
     "gif":   [(0, b"GIF87a"), (0, b"GIF89a")],
     "bmp":   [(0, b"BM")],
-    "webp":  [(0, b"RIFF")],  # refined below (WEBP subtype at offset 8)
+    "webp":  [(0, b"RIFF")],
     "ico":   [(0, b"\x00\x00\x01\x00")],
     "heic":  [(4, b"ftypheic"), (4, b"ftypheix"), (4, b"ftypmif1")],
     "tiff":  [(0, b"II*\x00"), (0, b"MM\x00*")],
-    # fonts
     "ttf":   [(0, b"\x00\x01\x00\x00"), (0, b"true")],
     "otf":   [(0, b"OTTO")],
     "woff":  [(0, b"wOFF")],
     "woff2": [(0, b"wOF2")],
 }
-# RIFF sub-family disambiguation (offset 8, 4 bytes) — WAV/AVI/WEBP all start "RIFF".
 _RIFF_SUBTYPES = {b"WAVE": "wav", b"AVI ": "avi", b"WEBP": "webp"}
-# Extension -> "family" so extension vs. sniffed-format comparisons don't
-# false-positive on same-family variants (e.g. .m4a is audio in an ftyp box).
 _EXT_FAMILY = {
     ".pdf": {"pdf"}, ".rtf": {"rtf"},
     ".doc": {"ole"}, ".xls": {"ole"}, ".ppt": {"ole"}, ".msi": {"ole", "exe"},
@@ -824,9 +800,7 @@ class ServerInfo:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 1 — content validation (inline, no new module) +
-# Phase 2 — WAF/CDN block detection (inline)
-# Best-effort: never crash the download because of validation itself.
+# Content validation + WAF/CDN block detection
 # ─────────────────────────────────────────────────────────────────────────────
 
 def looks_like_html(data: bytes) -> bool:
@@ -844,7 +818,6 @@ def _expected_binary(content_type: str, filename: str) -> bool:
     ext = "." + (filename.rsplit(".", 1)[-1].lower() if "." in filename else "")
     if ext in BINARY_EXTS:
         return True
-    # application/octet-stream, video/*, audio/*, image/* (except svg), zip-like, pdf, iso
     if ct.startswith(("video/", "audio/")):
         return True
     if ct in ("application/octet-stream", "application/pdf",
@@ -1034,8 +1007,6 @@ def inspect_url(session, url: str, log: logging.Logger) -> ServerInfo:
 
     log.info(f"HEAD {url} -> {total/1e6:.2f} MB | Range={accepts} | type={ctype}")
 
-    # Phase 1.2 — HEAD lies: probe first KB with a real Range GET and validate.
-    # Phase 2 — classify WAF/CDN challenge here, not as a generic network error.
     try:
         probe = session.get(
             url, headers={"Range": f"bytes=0-{PROBE_RANGE_SIZE}"},
@@ -1085,7 +1056,6 @@ def inspect_url(session, url: str, log: logging.Logger) -> ServerInfo:
     except RuntimeError:
         raise
     except Exception as e:
-        # Probe is best-effort: a probe failure must not mask a good HEAD.
         log.debug(f"inspect probe skipped/failed ({e}), trusting HEAD")
 
     return ServerInfo(total_bytes=total, accepts_range=accepts,
@@ -1093,7 +1063,6 @@ def inspect_url(session, url: str, log: logging.Logger) -> ServerInfo:
 
 
 def _backoff(attempt: int, blocked: bool = False) -> None:
-    # Phase 3 — exponential backoff with ±30% jitter; blocked retries wait a bit longer.
     base = min(2 ** (max(1, attempt) - 1), 30)
     if blocked:
         base = min(base * 1.5, 30)
@@ -1137,8 +1106,6 @@ def worker(
                 success = True
                 break
 
-            # Phase 3 — on retry after block/HTML, probe 1KB first with rotated UA
-            # before committing the whole chunk again.
             if attempt > 1 and (last_blocked or last_html):
                 try:
                     probe_end = min(start + PROBE_SMALL_SIZE, chunk.end)
@@ -1213,9 +1180,6 @@ def worker(
                 resp.raise_for_status()
 
                 if start > chunk.start and resp.status_code != 206:
-                    # Server ignored our partial Range request and is sending the
-                    # whole body from byte 0 — writing at `start` would corrupt the
-                    # file, so treat this chunk as if it were starting fresh.
                     log.warning(
                         f"[W{worker_id:02d}] chunk {chunk.index}: server did not honor Range "
                         f"(status {resp.status_code}), restarting chunk from the beginning"
@@ -1239,7 +1203,6 @@ def worker(
                         break
                     if not data:
                         continue
-                    # Phase 1+2 — inspect first bytes before trusting the stream.
                     if first:
                         first = False
                         try:
@@ -1296,9 +1259,6 @@ def worker(
                     pass
 
                 if poisoned:
-                    # Don't write partial HTML: roll back byte accounting for this
-                    # attempt (bytes already counted stay counted for progress,
-                    # but chunk position doesn't advance — next attempt re-reads).
                     if attempt < MAX_RETRIES:
                         _backoff(attempt, blocked=True)
                     continue
@@ -1360,7 +1320,6 @@ def worker(
                 chunk_q.task_done()
                 return
             except Exception as e:
-                # curl_cffi backend (or anything else): classify generically.
                 status_x = getattr(getattr(e, "response", None), "status_code", "?")
                 log.warning(tr.t("chunk_connection_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, error=e, attempt=attempt))
                 last_blocked = ("block" in str(e).lower() or "challenge" in str(e).lower()
@@ -1388,11 +1347,11 @@ def human_size(n: float) -> str:
 
 
 class _Tooltip:
-    """Minimal hover tooltip for a widget (Phase 0.3 — explanatory text)."""
+    """Minimal hover tooltip for a widget."""
 
     def __init__(self, widget, text_var):
         self.widget = widget
-        self.text_var = text_var  # callable returning the current text
+        self.text_var = text_var
         self.tipwindow = None
         widget.bind("<Enter>", self._show, add="+")
         widget.bind("<Leave>", self._hide, add="+")
@@ -1541,9 +1500,6 @@ class RapidGUI(tk.Tk):
         self.lbl_url.grid(row=0, column=0, sticky="w", **pad)
         self.url_var = tk.StringVar()
         ttk.Entry(self.frm_top, textvariable=self.url_var, width=64).grid(row=0, column=1, columnspan=3, sticky="we", **pad)
-        # A new/changed URL means the old "Save as" name (auto-filled for the
-        # previous link) no longer applies — track edits so we only clear it
-        # when the name was never actually chosen by the user.
         self._filename_user_edited = False
         self._suppress_filename_trace = False
         self._last_url_for_name = ""
@@ -1576,9 +1532,6 @@ class RapidGUI(tk.Tk):
         _Tooltip(self.spin_parts, lambda: self.tr.t("parts_help"))
         _Tooltip(self.lbl_parts, lambda: self.tr.t("parts_help"))
 
-        # Read-only display of the chunk count actually in use — never writes
-        # back into parts_var, so "0 = adaptive" stays adaptive across runs
-        # unless the user explicitly types a number.
         self.parts_actual_var = tk.StringVar(value="")
         self.lbl_parts_actual = ttk.Label(self.frm_top, textvariable=self.parts_actual_var, style="Muted.TLabel")
         self.lbl_parts_actual.grid(row=3, column=2, sticky="w", **pad)
@@ -2139,9 +2092,6 @@ class RapidGUI(tk.Tk):
             return
         self._last_url_for_name = url
         if not self._filename_user_edited:
-            # New link, name was never chosen by the user — reset so the
-            # next Verify/Download re-derives it instead of reusing (and
-            # silently overwriting) the previous download's file.
             self._set_filename_auto("")
             self.info = None
             self.info_var.set(self.tr.t("info_default"))
@@ -2149,7 +2099,7 @@ class RapidGUI(tk.Tk):
     def _on_browse(self):
         path = filedialog.asksaveasfilename(initialfile=self.filename_var.get() or "download")
         if path:
-            self.filename_var.set(path)  # explicit user choice — trace marks it as such
+            self.filename_var.set(path)
             self._filename_user_edited = True
 
     def _on_inspect(self):
@@ -2283,10 +2233,6 @@ class RapidGUI(tk.Tk):
             type=info.content_type,
         ))
 
-        # FIX — a direct download (no Verify click, no manual "Save as")
-        # only had the URL's last path segment to name the file. Now that
-        # the HEAD response is in, upgrade to the real server-suggested
-        # name (Content-Disposition) just like Verify already does.
         if auto_name and info.suggested_name and info.suggested_name != file_name:
             file_name = info.suggested_name
             self.after(0, lambda fn=file_name: self._set_filename_auto(fn))
@@ -2295,12 +2241,6 @@ class RapidGUI(tk.Tk):
             fresh_chunks = [Chunk(index=0, start=0, end=max(info.total_bytes - 1, 0))]
             part_size_used = max(info.total_bytes, 1)
         else:
-            # Phase 0.2 — "Workers" (concurrency) and "Number of parts" (how many
-            # slices the file is cut into) are independent knobs. If the user gave
-            # an explicit part count, derive part_size from it (clamped to a
-            # sensible minimum so a small file doesn't get sliced into thousands
-            # of pointless requests); otherwise fall back to the fixed
-            # CHUNK_PART_SIZE as before.
             if n_parts and n_parts > 0:
                 part_size_used = max(-(-info.total_bytes // n_parts), MIN_SPLIT_SIZE)  # ceil division
             else:
@@ -2373,8 +2313,6 @@ class RapidGUI(tk.Tk):
         file_lock = threading.Lock()
         state_lock = threading.Lock()
 
-        # Phase 3.1 — retry in rounds: first drain first-tries, then re-attack
-        # only the chunks that really failed, with alternate strategy (rotated UA).
         round_no = 0
         while round_no < MAX_ROUNDS:
             round_no += 1
@@ -2427,7 +2365,6 @@ class RapidGUI(tk.Tk):
             self._finish(success=False)
             return
 
-        # Phase 1.3 — flatline sanity: never mark HTML-as-file as done.
         try:
             if _expected_binary(info.content_type, file_name):
                 with open(file_name, "rb") as f:
