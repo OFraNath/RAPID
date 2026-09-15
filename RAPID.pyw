@@ -1,13 +1,5 @@
 """
 RAPID — Reliable Asynchronous Parallel Internet Downloader
-
-Qt/Fluent UI edition. The download core (Chunk, DownloadState, ServerInfo,
-Translator, ThemeManager file loading, validation, worker) is unchanged in
-behavior; only the presentation layer moved from Tkinter to PySide6 +
-QFluentWidgets (frameless window, custom title bar, QSS theming).
-
-The script is identical on Windows and Linux: no platform branches, only
-capability detection (e.g. "is this helper program available?").
 """
 
 from __future__ import annotations
