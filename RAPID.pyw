@@ -797,7 +797,7 @@ PrimaryPushButton {{
     border: 1px solid {accent};
     font-weight: 600;
 }}
-LineEdit, QLineEdit, ComboBox, QComboBox, SpinBox, QSpinBox {{
+QLineEdit, QComboBox, QSpinBox {{
     background-color: {in_bg};
     color: {in_fg};
     border: 1px solid {border};
@@ -805,7 +805,7 @@ LineEdit, QLineEdit, ComboBox, QComboBox, SpinBox, QSpinBox {{
     padding: 6px 10px;
     selection-background-color: {accent};
 }}
-LineEdit:focus, QLineEdit:focus, ComboBox:focus, QComboBox:focus {{
+QLineEdit:focus, QComboBox:focus {{
     border: 1px solid {accent};
 }}
 QComboBox QAbstractItemView, QListView {{
@@ -1709,10 +1709,6 @@ class RapidWindow(FluentBaseWidget):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
-        # Leave room for the Fluent title bar (custom, frameless). Its real
-        # height isn't reliable yet here (layout hasn't been activated), so
-        # use a safe fixed fallback; showEvent() below corrects it once the
-        # title bar has its real, laid-out height.
         root.setContentsMargins(12, 44, 12, 12)
         root.setSpacing(8)
 
@@ -1794,9 +1790,6 @@ class RapidWindow(FluentBaseWidget):
             self.spin_workers.setValue(DEFAULT_WORKERS)
         except Exception:
             pass
-        # Fixed (not just capped) width — sizeHint alone gave Workers and
-        # Parts different natural widths even though both just show 1-5
-        # digit numbers. Same literal pixel size on both, no ambiguity.
         self.spin_workers.setFixedWidth(150)
         url_row.addWidget(self.spin_workers, 2, 1, Qt.AlignLeft)
 
@@ -1819,9 +1812,6 @@ class RapidWindow(FluentBaseWidget):
         parts_box.addStretch(1)
         parts_wrap = QWidget(src_card)
         parts_wrap.setLayout(parts_box)
-        # Without this, a bare QWidget doesn't stretch to fill the grid cell
-        # like QSpinBox/QLineEdit do above it — it hugs its content's minimum
-        # width instead, breaking the row-to-row alignment.
         parts_wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         url_row.addWidget(parts_wrap, 3, 1, 1, 2)
 
@@ -2031,8 +2021,6 @@ class RapidWindow(FluentBaseWidget):
             if self.th.current != self._committed_theme:
                 self.th.set_theme(self._committed_theme)
                 self._apply_theme()
-        # If the highlighted item differs from committed, Qt already keeps the
-        # combo text — treat a popup close as cancel unless activated fired.
         if code != self._committed_theme and self.th.current != self._committed_theme:
             try:
                 committed_name = dict(self._theme_codes).get(self._committed_theme, self._committed_theme)
@@ -2063,8 +2051,6 @@ class RapidWindow(FluentBaseWidget):
             self.setStyleSheet(build_qss(c))
         except Exception as e:
             self.log.debug(f"QSS apply skipped ({e}).")
-        # Keep Fluent internals (popups, scrollbars) in matching light/dark mode
-        # and tint them with the theme accent.
         try:
             if _HAS_FLUENT and _fluent_setTheme is not None and _FluentTheme is not None:
                 _fluent_setTheme(
@@ -2078,14 +2064,7 @@ class RapidWindow(FluentBaseWidget):
         try:
             bar = getattr(self, "titleBar", None)
             if bar is not None:
-                # Plain QWidget subclasses (which TitleBar is) ignore the
-                # stylesheet's background-color unless this is set — without
-                # it Qt silently keeps painting the default system color.
                 bar.setAttribute(Qt.WA_StyledBackground, True)
-                # No border-bottom here: `bar` only covers the icon+title
-                # area, not the full width up to the min/max/close buttons,
-                # so a border on it reads as a stray underline instead of a
-                # clean divider. Background/text tint only.
                 bar.setStyleSheet(
                     f"background-color: {c.get('background_color', '#2b2b2b')};"
                     f"color: {c.get('text_color', '#ffffff')};"
