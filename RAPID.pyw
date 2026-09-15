@@ -733,6 +733,22 @@ def build_qss(c: dict[str, str]) -> str:
 
     The .theme files stay the single source of truth; this is only the
     consumer that replaces the old ttk.Style mapping.
+
+    IMPORTANT — why the Fluent widget classes are NOT styled here:
+    qfluentwidgets components (CardWidget, PushButton, PrimaryPushButton,
+    LineEdit, ComboBox, SpinBox, ProgressBar, ...) paint their own rounded
+    corners in paintEvent() with their own anti-aliasing, driven by
+    setTheme()/setThemeColor() (see _apply_theme()). If we ALSO hand Qt's
+    stylesheet engine a `border` + `border-radius` for those same class
+    names, both painters draw a rounded rect on top of each other with
+    slightly different radii/AA, which is exactly the "two curves — one
+    faint, one strong, square corners peeking out behind" artifact.
+
+    So: Fluent-native widgets are themed exclusively via setTheme()/
+    setThemeColor() in _apply_theme(). This QSS only touches plain Qt
+    widgets (QGroupBox, QToolTip, QScrollBar, QLabel, the frameless-window
+    root, and the QFrame/QLineEdit/etc. fallbacks used when qfluentwidgets
+    isn't installed, i.e. when _HAS_FLUENT is False).
     """
     bg = c.get("background_color", "#2b2b2b")
     fg = c.get("text_color", "#ffffff")
@@ -745,7 +761,8 @@ def build_qss(c: dict[str, str]) -> str:
     accent = c.get("accent_color", "#3a7bd5")
     log_bg = c.get("log_background_color", "#111111")
     log_fg = c.get("log_text_color", "#dddddd")
-    return f"""
+
+    base = f"""
 * {{ font-family: "Segoe UI", "Inter", "Cantarell", sans-serif; }}
 RapidWindow, QWidget#rapidRoot {{
     background-color: {bg};
@@ -759,11 +776,6 @@ QLabel#titleAccent {{
     font-size: 20px;
 }}
 QLabel#clock {{ color: {muted}; }}
-CardWidget, QFrame#card {{
-    background-color: {bg};
-    border: 1px solid {border};
-    border-radius: 12px;
-}}
 QGroupBox {{
     background-color: {bg};
     color: {fg};
@@ -777,57 +789,6 @@ QGroupBox::title {{
     left: 12px;
     padding: 0 4px;
     color: {fg};
-}}
-PushButton, PrimaryPushButton, QPushButton {{
-    background-color: {btn_bg};
-    color: {btn_fg};
-    border: 1px solid {border};
-    border-radius: 8px;
-    padding: 7px 16px;
-}}
-PushButton:hover, QPushButton:hover {{
-    border: 1px solid {accent};
-}}
-PushButton:disabled, QPushButton:disabled {{
-    color: {muted};
-}}
-PrimaryPushButton {{
-    background-color: {accent};
-    color: {in_bg};
-    border: 1px solid {accent};
-    font-weight: 600;
-}}
-QLineEdit, QComboBox, QSpinBox {{
-    background-color: {in_bg};
-    color: {in_fg};
-    border: 1px solid {border};
-    border-radius: 8px;
-    padding: 6px 10px;
-    selection-background-color: {accent};
-}}
-QLineEdit:focus, QComboBox:focus {{
-    border: 1px solid {accent};
-}}
-QComboBox QAbstractItemView, QListView {{
-    background-color: {in_bg};
-    color: {in_fg};
-    selection-background-color: {accent};
-    selection-color: {in_bg};
-    border: 1px solid {border};
-    border-radius: 8px;
-    outline: 0;
-}}
-ProgressBar, QProgressBar {{
-    background-color: {btn_bg};
-    border: 1px solid {border};
-    border-radius: 8px;
-    height: 14px;
-    text-align: center;
-    color: {fg};
-}}
-ProgressBar::chunk, QProgressBar::chunk {{
-    background-color: {accent};
-    border-radius: 6px;
 }}
 TextEdit, QTextEdit, QPlainTextEdit {{
     background-color: {log_bg};
@@ -855,6 +816,83 @@ QScrollBar::handle:vertical {{
 }}
 QScrollBar::handle:vertical:hover {{ background: {accent}; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+"""
+
+    if _HAS_FLUENT:
+        # Fluent widgets are live: leave CardWidget/PushButton/PrimaryPushButton/
+        # LineEdit/ComboBox/SpinBox/ProgressBar untouched here — they are themed
+        # via setTheme()/setThemeColor() in _apply_theme(). We only give a raw
+        # QFrame#card (a plain-Qt card container, NOT the Fluent CardWidget) a
+        # matching look so it doesn't stick out if one is ever used.
+        return base + f"""
+QFrame#card {{
+    background-color: {bg};
+    border: 1px solid {border};
+    border-radius: 12px;
+}}
+"""
+
+    # Fallback mode (qfluentwidgets not installed): CardWidget/PushButton/etc.
+    # are plain QWidget/QPushButton/QLineEdit/... aliases (see the except
+    # branch of the qfluentwidgets import above), so nothing paints its own
+    # rounded corners for them — they need the full QSS treatment.
+    return base + f"""
+CardWidget, QFrame#card {{
+    background-color: {bg};
+    border: 1px solid {border};
+    border-radius: 12px;
+}}
+PushButton, PrimaryPushButton, QPushButton {{
+    background-color: {btn_bg};
+    color: {btn_fg};
+    border: 1px solid {border};
+    border-radius: 8px;
+    padding: 7px 16px;
+}}
+PushButton:hover, QPushButton:hover {{
+    border: 1px solid {accent};
+}}
+PushButton:disabled, QPushButton:disabled {{
+    color: {muted};
+}}
+PrimaryPushButton {{
+    background-color: {accent};
+    color: {in_bg};
+    border: 1px solid {accent};
+    font-weight: 600;
+}}
+LineEdit, ComboBox, SpinBox, QLineEdit, QComboBox, QSpinBox {{
+    background-color: {in_bg};
+    color: {in_fg};
+    border: 1px solid {border};
+    border-radius: 8px;
+    padding: 6px 10px;
+    selection-background-color: {accent};
+}}
+LineEdit:focus, ComboBox:focus, QLineEdit:focus, QComboBox:focus {{
+    border: 1px solid {accent};
+}}
+QComboBox QAbstractItemView, QListView {{
+    background-color: {in_bg};
+    color: {in_fg};
+    selection-background-color: {accent};
+    selection-color: {in_bg};
+    border: 1px solid {border};
+    border-radius: 8px;
+    outline: 0;
+}}
+ProgressBar, QProgressBar {{
+    background-color: {btn_bg};
+    border: 1px solid {border};
+    border-radius: 8px;
+    height: 14px;
+    text-align: center;
+    color: {fg};
+}}
+ProgressBar::chunk, QProgressBar::chunk {{
+    background-color: {accent};
+    border-radius: 6px;
+}}
 """
 
 
