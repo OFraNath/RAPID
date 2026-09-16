@@ -9,7 +9,6 @@ import configparser
 import importlib
 import importlib.util
 import logging
-import shutil
 import subprocess
 import sys
 import os
@@ -23,8 +22,8 @@ else:
     BASE_DIR = Path(__file__).resolve().parent
 LOG_FILE = BASE_DIR / "rapid.log"
 if getattr(sys, "frozen", False):
-    LANGUAGES_DIR = Path(sys._MEIPASS) / "languages"  # type: ignore[attr-defined]
-    THEMES_DIR = Path(sys._MEIPASS) / "themes"  # type: ignore[attr-defined]
+    LANGUAGES_DIR = Path(sys._MEIPASS) / "languages"
+    THEMES_DIR = Path(sys._MEIPASS) / "themes"
 else:
     LANGUAGES_DIR = BASE_DIR / "languages"
     THEMES_DIR = BASE_DIR / "themes"
@@ -162,10 +161,8 @@ except Exception:
 
 _THIRD_PARTY_PACKAGES = {
     "requests": "requests",
-    "urllib3": "urllib3",
+    "urllib3":  "urllib3",
     "curl_cffi": "curl_cffi",
-    "PySide6": "PySide6",
-    "qfluentwidgets": "PySide6-Fluent-Widgets",
 }
 
 
@@ -215,6 +212,23 @@ def _ensure_dependencies() -> None:
     _EARLY_LOG.info(ok)
 
 
+def _check_tkinter() -> None:
+    if importlib.util.find_spec("tkinter") is None:
+        err = (
+            "The 'tkinter' module is missing from this Python install.\n"
+            "        pip cannot install it — it ships with the Python interpreter itself.\n"
+            "        Debian/Ubuntu:  sudo apt install python3-tk\n"
+            "        Fedora:         sudo dnf install python3-tkinter\n"
+            "        macOS (brew):   brew install python-tk\n"
+            "        Windows:        reinstall Python from python.org with the\n"
+            "                        \"tcl/tk and IDLE\" option checked."
+        )
+        print(f"[RAPID] {err}")
+        _EARLY_LOG.critical(err)
+        sys.exit(1)
+
+
+_check_tkinter()
 _ensure_dependencies()
 
 import json
@@ -223,8 +237,10 @@ import queue
 import random
 import threading
 import time
+import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 from urllib.parse import unquote, urlparse
 
@@ -233,145 +249,62 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Qt imports (after _ensure_dependencies so auto-install applies to them too)
-# ─────────────────────────────────────────────────────────────────────────────
-
-from PySide6.QtCore import Qt, QTimer, Signal, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QTextCharFormat, QTextCursor
-from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QMessageBox,
-    QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
-)
-
-try:  # Fluent widgets — preferred presentation layer (GPLv3, same as RAPID)
-    from qfluentwidgets import (
-        CardWidget as _FluentCard,
-        ComboBox as _FluentComboBox,
-        LineEdit as _FluentLineEdit,
-        MessageBox as _FluentMessageBox,
-        PrimaryPushButton as _FluentPrimaryButton,
-        ProgressBar as _FluentProgressBar,
-        PushButton as _FluentPushButton,
-        SpinBox as _FluentSpinBox,
-        FluentWidget as _FluentBase,
-        setTheme as _fluent_setTheme,
-        setThemeColor as _fluent_setThemeColor,
-        Theme as _FluentTheme,
-    )
-    _HAS_FLUENT = True
-except Exception as _fluent_err:  # pragma: no cover — degraded fallback
-    _EARLY_LOG.warning(f"qfluentwidgets unavailable ({_fluent_err}), using plain Qt widgets.")
-    _HAS_FLUENT = False
-    from PySide6.QtWidgets import (
-        QComboBox as _FluentComboBox,
-        QFrame as _FluentCard,
-        QLineEdit as _FluentLineEdit,
-        QProgressBar as _FluentProgressBar,
-        QPushButton as _FluentPushButton,
-        QPushButton as _FluentPrimaryButton,
-        QSpinBox as _FluentSpinBox,
-        QWidget as _FluentBase,
-    )
-    _FluentMessageBox = None  # type: ignore[assignment]
-    _fluent_setTheme = None  # type: ignore[assignment]
-    _fluent_setThemeColor = None  # type: ignore[assignment]
-    _FluentTheme = None  # type: ignore[assignment]
-
-# Public aliases used throughout the GUI code below.
-CardWidget = _FluentCard
-ComboBox = _FluentComboBox
-LineEdit = _FluentLineEdit
-FluentMessageBox = _FluentMessageBox
-PrimaryPushButton = _FluentPrimaryButton
-ProgressBar = _FluentProgressBar
-PushButton = _FluentPushButton
-SpinBox = _FluentSpinBox
-FluentBaseWidget = _FluentBase
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sleep inhibition — universal, capability-based (no platform branches).
-# Tries each OS mechanism only if its API/helper exists on this machine,
-# so the exact same code runs on Windows and Linux.
-# ─────────────────────────────────────────────────────────────────────────────
 
 _caffeinate_proc = None  # type: ignore[assignment]
 
 
 def prevent_sleep(log: "logging.Logger") -> None:
-    """Ask the OS not to sleep while downloading (best effort, any OS)."""
+    """Ask the OS not to sleep/turn off the display while downloading."""
     global _caffeinate_proc
-    # Windows execution-state API — only if this interpreter exposes it.
     try:
-        import ctypes
-
-        windll = getattr(ctypes, "windll", None)
-        kernel32 = getattr(windll, "kernel32", None) if windll is not None else None
-        if kernel32 is not None and hasattr(kernel32, "SetThreadExecutionState"):
+        if sys.platform.startswith("win"):
+            import ctypes
             ES_CONTINUOUS = 0x80000000
             ES_SYSTEM_REQUIRED = 0x00000001
             ES_DISPLAY_REQUIRED = 0x00000002
-            kernel32.SetThreadExecutionState(
+            ctypes.windll.kernel32.SetThreadExecutionState(
                 ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
             )
-            log.debug("prevent_sleep: Windows execution state set.")
-            return
-    except Exception as e:
-        log.debug(f"prevent_sleep: Windows API not used ({e}).")
-    # macOS caffeinate helper — only if present.
-    try:
-        if shutil.which("caffeinate"):
+        elif sys.platform == "darwin":
             if _caffeinate_proc is None or _caffeinate_proc.poll() is not None:
                 _caffeinate_proc = subprocess.Popen(
                     ["caffeinate", "-i"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
-                log.debug("prevent_sleep: caffeinate started.")
-                return
+        else:
+            try:
+                if _caffeinate_proc is None or _caffeinate_proc.poll() is not None:
+                    _caffeinate_proc = subprocess.Popen(
+                        [
+                            "systemd-inhibit", "--what=idle:sleep",
+                            "--who=RAPID", "--why=Active download in progress",
+                            "sleep", "infinity",
+                        ],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+            except FileNotFoundError:
+                _caffeinate_proc = None
     except Exception as e:
-        log.debug(f"prevent_sleep: caffeinate not used ({e}).")
-    # Linux systemd inhibitor — only if present.
-    try:
-        if shutil.which("systemd-inhibit"):
-            if _caffeinate_proc is None or _caffeinate_proc.poll() is not None:
-                _caffeinate_proc = subprocess.Popen(
-                    [
-                        "systemd-inhibit", "--what=idle:sleep",
-                        "--who=RAPID", "--why=Active download in progress",
-                        "sleep", "infinity",
-                    ],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-                log.debug("prevent_sleep: systemd-inhibit started.")
-                return
-    except Exception as e:
-        log.debug(f"prevent_sleep: systemd-inhibit not used ({e}).")
-    log.debug("prevent_sleep: no inhibitor available, continuing without it.")
+        log.debug(f"prevent_sleep: could not inhibit sleep ({e}), continuing without it.")
 
 
 def allow_sleep(log: "logging.Logger") -> None:
     """Undo prevent_sleep() once a download finishes/cancels/fails."""
     global _caffeinate_proc
     try:
-        import ctypes
-
-        windll = getattr(ctypes, "windll", None)
-        kernel32 = getattr(windll, "kernel32", None) if windll is not None else None
-        if kernel32 is not None and hasattr(kernel32, "SetThreadExecutionState"):
+        if sys.platform.startswith("win"):
+            import ctypes
             ES_CONTINUOUS = 0x80000000
-            kernel32.SetThreadExecutionState(ES_CONTINUOUS)
-            log.debug("allow_sleep: Windows execution state cleared.")
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        else:
+            if _caffeinate_proc is not None:
+                try:
+                    _caffeinate_proc.terminate()
+                except Exception:
+                    pass
+                _caffeinate_proc = None
     except Exception as e:
-        log.debug(f"allow_sleep: Windows API not cleared ({e}).")
-    try:
-        if _caffeinate_proc is not None:
-            try:
-                _caffeinate_proc.terminate()
-            except Exception:
-                pass
-            _caffeinate_proc = None
-            log.debug("allow_sleep: helper inhibitor stopped.")
-    except Exception as e:
-        log.debug(f"allow_sleep: could not release helper inhibitor ({e}).")
+        log.debug(f"allow_sleep: could not release sleep inhibitor ({e}), continuing.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -706,186 +639,6 @@ class ThemeManager:
 
     def colors(self) -> dict[str, str]:
         return self.catalogs.get(self.current, _BUILTIN_LIGHT)
-
-
-def theme_luminance(colors: dict[str, str]) -> float:
-    """Background luminance 0-255, used to pick Fluent light/dark mode."""
-    hx = colors.get("background_color", "#808080").lstrip("#")
-    try:
-        r = int(hx[0:2], 16)
-        g = int(hx[2:4], 16)
-        b = int(hx[4:6], 16)
-        return 0.299 * r + 0.587 * g + 0.114 * b
-    except Exception:
-        return 128.0
-
-
-def build_qss(c: dict[str, str]) -> str:
-    """Map a ThemeManager palette (the 11 *.theme keys) onto Qt/Fluent QSS.
-
-    The .theme files stay the single source of truth; this is only the
-    consumer that replaces the old ttk.Style mapping.
-
-    IMPORTANT — why the Fluent widget classes are NOT styled here:
-    qfluentwidgets components (CardWidget, PushButton, PrimaryPushButton,
-    LineEdit, ComboBox, SpinBox, ProgressBar, ...) paint their own rounded
-    corners in paintEvent() with their own anti-aliasing, driven by
-    setTheme()/setThemeColor() (see _apply_theme()). If we ALSO hand Qt's
-    stylesheet engine a `border` + `border-radius` for those same class
-    names, both painters draw a rounded rect on top of each other with
-    slightly different radii/AA, which is exactly the "two curves — one
-    faint, one strong, square corners peeking out behind" artifact.
-
-    So: Fluent-native widgets are themed exclusively via setTheme()/
-    setThemeColor() in _apply_theme(). This QSS only touches plain Qt
-    widgets (QGroupBox, QToolTip, QScrollBar, QLabel, the frameless-window
-    root, and the QFrame/QLineEdit/etc. fallbacks used when qfluentwidgets
-    isn't installed, i.e. when _HAS_FLUENT is False).
-    """
-    bg = c.get("background_color", "#2b2b2b")
-    fg = c.get("text_color", "#ffffff")
-    muted = c.get("secondary_text_color", "#aaaaaa")
-    border = c.get("border_color", "#555555")
-    btn_bg = c.get("button_background_color", "#3a3a3a")
-    btn_fg = c.get("button_text_color", "#ffffff")
-    in_bg = c.get("input_background_color", "#1e1e1e")
-    in_fg = c.get("input_text_color", "#ffffff")
-    accent = c.get("accent_color", "#3a7bd5")
-    log_bg = c.get("log_background_color", "#111111")
-    log_fg = c.get("log_text_color", "#dddddd")
-
-    base = f"""
-* {{ font-family: "Segoe UI", "Inter", "Cantarell", sans-serif; }}
-RapidWindow, QWidget#rapidRoot {{
-    background-color: {bg};
-    color: {fg};
-}}
-QLabel {{ background: transparent; color: {fg}; }}
-QLabel#muted {{ color: {muted}; }}
-QLabel#titleAccent {{
-    color: {accent};
-    font-weight: 700;
-    font-size: 20px;
-}}
-QLabel#clock {{ color: {muted}; }}
-QGroupBox {{
-    background-color: {bg};
-    color: {fg};
-    border: 1px solid {border};
-    border-radius: 12px;
-    margin-top: 12px;
-    padding-top: 8px;
-}}
-QGroupBox::title {{
-    subcontrol-origin: margin;
-    left: 12px;
-    padding: 0 4px;
-    color: {fg};
-}}
-TextEdit, QTextEdit, QPlainTextEdit {{
-    background-color: {log_bg};
-    color: {log_fg};
-    border: 1px solid {border};
-    border-radius: 12px;
-    padding: 6px;
-}}
-QToolTip {{
-    background-color: {in_bg};
-    color: {in_fg};
-    border: 1px solid {accent};
-    border-radius: 6px;
-    padding: 4px 8px;
-}}
-QScrollBar:vertical {{
-    background: transparent;
-    width: 10px;
-    margin: 2px;
-}}
-QScrollBar::handle:vertical {{
-    background: {border};
-    border-radius: 5px;
-    min-height: 30px;
-}}
-QScrollBar::handle:vertical:hover {{ background: {accent}; }}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-"""
-
-    if _HAS_FLUENT:
-        # Fluent widgets are live: leave CardWidget/PushButton/PrimaryPushButton/
-        # LineEdit/ComboBox/SpinBox/ProgressBar untouched here — they are themed
-        # via setTheme()/setThemeColor() in _apply_theme(). We only give a raw
-        # QFrame#card (a plain-Qt card container, NOT the Fluent CardWidget) a
-        # matching look so it doesn't stick out if one is ever used.
-        return base + f"""
-QFrame#card {{
-    background-color: {bg};
-    border: 1px solid {border};
-    border-radius: 12px;
-}}
-"""
-
-    # Fallback mode (qfluentwidgets not installed): CardWidget/PushButton/etc.
-    # are plain QWidget/QPushButton/QLineEdit/... aliases (see the except
-    # branch of the qfluentwidgets import above), so nothing paints its own
-    # rounded corners for them — they need the full QSS treatment.
-    return base + f"""
-CardWidget, QFrame#card {{
-    background-color: {bg};
-    border: 1px solid {border};
-    border-radius: 12px;
-}}
-PushButton, PrimaryPushButton, QPushButton {{
-    background-color: {btn_bg};
-    color: {btn_fg};
-    border: 1px solid {border};
-    border-radius: 8px;
-    padding: 7px 16px;
-}}
-PushButton:hover, QPushButton:hover {{
-    border: 1px solid {accent};
-}}
-PushButton:disabled, QPushButton:disabled {{
-    color: {muted};
-}}
-PrimaryPushButton {{
-    background-color: {accent};
-    color: {in_bg};
-    border: 1px solid {accent};
-    font-weight: 600;
-}}
-LineEdit, ComboBox, SpinBox, QLineEdit, QComboBox, QSpinBox {{
-    background-color: {in_bg};
-    color: {in_fg};
-    border: 1px solid {border};
-    border-radius: 8px;
-    padding: 6px 10px;
-    selection-background-color: {accent};
-}}
-LineEdit:focus, ComboBox:focus, QLineEdit:focus, QComboBox:focus {{
-    border: 1px solid {accent};
-}}
-QComboBox QAbstractItemView, QListView {{
-    background-color: {in_bg};
-    color: {in_fg};
-    selection-background-color: {accent};
-    selection-color: {in_bg};
-    border: 1px solid {border};
-    border-radius: 8px;
-    outline: 0;
-}}
-ProgressBar, QProgressBar {{
-    background-color: {btn_bg};
-    border: 1px solid {border};
-    border-radius: 8px;
-    height: 14px;
-    text-align: center;
-    color: {fg};
-}}
-ProgressBar::chunk, QProgressBar::chunk {{
-    background-color: {accent};
-    border-radius: 6px;
-}}
-"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1589,7 +1342,7 @@ def worker(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GUI (PySide6 + QFluentWidgets)
+# GUI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def human_size(n: float) -> str:
@@ -1600,48 +1353,50 @@ def human_size(n: float) -> str:
     return f"{n:.1f} PB"
 
 
-def _show_warning(parent: QWidget, title: str, text: str) -> None:
-    try:
-        if FluentMessageBox is not None:
-            box = FluentMessageBox(title, text, parent)
-            box.exec()
+class _Tooltip:
+    """Minimal hover tooltip for a widget."""
+
+    def __init__(self, widget, text_var):
+        self.widget = widget
+        self.text_var = text_var
+        self.tipwindow = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, _event=None):
+        text = self.text_var() if callable(self.text_var) else self.text_var
+        if not text or self.tipwindow is not None:
             return
-    except Exception:
-        pass
-    QMessageBox.warning(parent, title, text)
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+            tw = tk.Toplevel(self.widget)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{x}+{y}")
+            lbl = tk.Label(
+                tw, text=text, justify="left", background="#ffffe0",
+                relief="solid", borderwidth=1, wraplength=340,
+                font=("TkDefaultFont", 8),
+            )
+            lbl.pack(ipadx=4, ipady=2)
+            self.tipwindow = tw
+        except Exception:
+            self.tipwindow = None
+
+    def _hide(self, _event=None):
+        if self.tipwindow is not None:
+            try:
+                self.tipwindow.destroy()
+            except Exception:
+                pass
+            self.tipwindow = None
+
+    def update_text(self):
+        """Call after a language change so a currently-open tooltip refreshes."""
+        self._hide()
 
 
-def _show_info(parent: QWidget, title: str, text: str) -> None:
-    try:
-        if FluentMessageBox is not None:
-            box = FluentMessageBox(title, text, parent)
-            box.exec()
-            return
-    except Exception:
-        pass
-    QMessageBox.information(parent, title, text)
-
-
-def _ask_yes_no(parent: QWidget, title: str, text: str) -> bool:
-    try:
-        if FluentMessageBox is not None:
-            box = FluentMessageBox(title, text, parent)
-            return bool(box.exec())
-    except Exception:
-        pass
-    return QMessageBox.question(parent, title, text) == QMessageBox.StandardButton.Yes
-
-
-class RapidWindow(FluentBaseWidget):
-    """Frameless Fluent window. Same download behavior as before — new look."""
-
-    # Thread-safe UI updates (emitted from the download thread, applied on GUI thread)
-    _sig_filename = Signal(str)
-    _sig_info = Signal(str)
-    _sig_parts = Signal(int)
-    _sig_finish = Signal(bool)
-    _sig_retranslate = Signal()
-
+class RapidGUI(tk.Tk):
     def __init__(self):
         super().__init__()
 
@@ -1656,25 +1411,19 @@ class RapidWindow(FluentBaseWidget):
         self._gui_log_handler.setLevel(logging.DEBUG)
         self.log.addHandler(self._gui_log_handler)
 
-        self.log.info("GUI initialized (Qt/Fluent)")
+        self.log.info("GUI initialized")
         self.tr = Translator(LANGUAGES_DIR, self.log)
         self.th = ThemeManager(THEMES_DIR, self.log)
         self._load_preferences()
-
-        self.setObjectName("rapidRoot")
-        self.setWindowTitle(self.tr.t("window_title"))
-        self.resize(680, 640)
+        self.style = ttk.Style(self)
         try:
-            self.setMinimumSize(620, 560)
-        except Exception:
+            self.style.theme_use("clam")
+        except tk.TclError:
             pass
-        # Identical look on every OS: no mica/acrylic compositor blur, the
-        # theme palette is drawn by Qt itself (see UPDATE.md — no pywinstyles).
-        for _meth in ("setMicaEffectEnabled", "setAcrylicEnabled"):
-            try:
-                getattr(self, _meth)(False)
-            except Exception:
-                pass
+
+        self.title(self.tr.t("window_title"))
+        self.geometry("640x560")
+        self.resizable(False, False)
 
         self.stop_event = threading.Event()
         self.download_thread: Optional[threading.Thread] = None
@@ -1683,259 +1432,171 @@ class RapidWindow(FluentBaseWidget):
         self.start_time = 0.0
         self.running = False
 
+
+
         self._rgb_hue: float = 200.0
+        self._rgb_job: Optional[str] = None
         self._rgb_interval_ms: int = int(self.th.cycle_params.get("rgb", {}).get("cycle_interval_ms", 80))
         self._rgb_step_deg: float = float(self.th.cycle_params.get("rgb", {}).get("cycle_step_deg", 0.5))
+
         self._rgb_interval_ms = max(50, min(1000, self._rgb_interval_ms))
         self._rgb_step_deg = max(0.05, min(3.0, self._rgb_step_deg))
-        self._rgb_timer = QTimer(self)
-        self._rgb_timer.timeout.connect(self._rgb_tick)
 
         self._log_buffer: "list[str]" = []
         self._fade_counter = 0
 
+        self._build_ui()
+        self._apply_theme()
+        self.after(150, self._poll_log)
+        self.after(200, self._poll_progress)
+        self.after(90, self._drain_log_buffer)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── UI ──
+
+    def _build_ui(self):
+        pad = {"padx": 6, "pady": 4}
+
+        frm_lang = ttk.Frame(self)
+        frm_lang.pack(fill="x", padx=6, pady=(6, 0))
+        self.lbl_lang = ttk.Label(frm_lang, text=self.tr.t("language_label"))
+        self.lbl_lang.pack(side="left")
+
+        self._lang_codes = self.tr.available()
+        self.lang_var = tk.StringVar(value=dict(self._lang_codes).get(self.tr.current, "English"))
+        lang_combo = ttk.Combobox(
+            frm_lang, textvariable=self.lang_var, state="readonly",
+            values=[name for _, name in self._lang_codes], width=24,
+        )
+        lang_combo.pack(side="left", padx=(6, 0))
+        lang_combo.bind("<<ComboboxSelected>>", self._on_language_change)
+
+        self.lbl_theme = ttk.Label(frm_lang, text=self.tr.t("theme_label"))
+        self.lbl_theme.pack(side="left", padx=(18, 0))
+
+        self._theme_codes = self.th.available()
+        self.theme_var = tk.StringVar(value=dict(self._theme_codes).get(self.th.current, "Light"))
+        theme_combo = ttk.Combobox(
+            frm_lang, textvariable=self.theme_var, state="readonly",
+            values=[name for _, name in self._theme_codes], width=16,
+        )
+        theme_combo.pack(side="left", padx=(6, 0))
+        theme_combo.bind("<<ComboboxSelected>>", self._on_theme_change)
+        # ── theme live preview (arrow keys / mouse hover) ──
+        self.theme_combo = theme_combo
+        self._committed_theme = self.th.current
+        self._theme_listbox = None
+
+        theme_combo.bind("<Button-1>", lambda _e: self.after(20, self._hook_theme_listbox), add="+")
+        theme_combo.bind("<KeyPress>", self._on_theme_combo_keypress_hook, add="+")
+        for _seq in ("<KeyRelease-Up>", "<KeyRelease-Down>", "<KeyRelease-Prior>",
+                     "<KeyRelease-Next>", "<KeyRelease-Home>", "<KeyRelease-End>"):
+            theme_combo.bind(_seq, self._on_theme_key_preview, add="+")
+        theme_combo.bind("<Escape>", self._on_theme_preview_revert, add="+")
+        theme_combo.bind("<FocusOut>", self._on_theme_focus_out, add="+")
+
+        self.clock_var = tk.StringVar(value="")
+        self.lbl_clock = ttk.Label(frm_lang, textvariable=self.clock_var, style="Muted.TLabel")
+        self.lbl_clock.pack(side="right", padx=(6, 0))
+        self._update_clock()
+
+        self.frm_top = ttk.LabelFrame(self, text=self.tr.t("source_frame"))
+        self.frm_top.pack(fill="x", **pad)
+
+        self.lbl_url = ttk.Label(self.frm_top, text=self.tr.t("url_label"))
+        self.lbl_url.grid(row=0, column=0, sticky="w", **pad)
+        self.url_var = tk.StringVar()
+        ttk.Entry(self.frm_top, textvariable=self.url_var, width=64).grid(row=0, column=1, columnspan=3, sticky="we", **pad)
         self._filename_user_edited = False
         self._suppress_filename_trace = False
         self._last_url_for_name = ""
-        self._updating_url_programmatically = False
+        self.url_var.trace_add("write", self._on_url_changed)
 
-        self._build_ui()
-        self._wire_signals()
-        self._apply_theme()
-        self._retranslate_static_ui()
+        self.btn_verify = ttk.Button(self.frm_top, text=self.tr.t("verify_btn"), command=self._on_inspect)
+        self.btn_verify.grid(row=0, column=4, **pad)
 
-        self._poll_log_timer = QTimer(self)
-        self._poll_log_timer.timeout.connect(self._poll_log)
-        self._poll_log_timer.start(150)
+        self.lbl_save_as = ttk.Label(self.frm_top, text=self.tr.t("save_as_label"))
+        self.lbl_save_as.grid(row=1, column=0, sticky="w", **pad)
+        self.filename_var = tk.StringVar()
+        self.filename_var.trace_add("write", self._on_filename_var_written)
+        ttk.Entry(self.frm_top, textvariable=self.filename_var, width=48).grid(row=1, column=1, columnspan=2, sticky="we", **pad)
+        self.btn_browse = ttk.Button(self.frm_top, text=self.tr.t("browse_btn"), command=self._on_browse)
+        self.btn_browse.grid(row=1, column=3, **pad)
 
-        self._drain_timer = QTimer(self)
-        self._drain_timer.timeout.connect(self._drain_log_buffer)
-        self._drain_timer.start(90)
+        self.lbl_workers = ttk.Label(self.frm_top, text=self.tr.t("workers_label"))
+        self.lbl_workers.grid(row=2, column=0, sticky="w", **pad)
+        self.workers_var = tk.IntVar(value=DEFAULT_WORKERS)
+        self.spin_workers = ttk.Spinbox(self.frm_top, from_=1, to=MAX_WORKERS, textvariable=self.workers_var, width=6)
+        self.spin_workers.grid(row=2, column=1, sticky="w", **pad)
+        _Tooltip(self.spin_workers, lambda: self.tr.t("workers_help"))
+        _Tooltip(self.lbl_workers, lambda: self.tr.t("workers_help"))
 
-        self._poll_progress_timer = QTimer(self)
-        self._poll_progress_timer.timeout.connect(self._poll_progress)
-        self._poll_progress_timer.start(300)
+        self.lbl_parts = ttk.Label(self.frm_top, text=self.tr.t("parts_label"))
+        self.lbl_parts.grid(row=3, column=0, sticky="w", **pad)
+        self.parts_var = tk.IntVar(value=0)
+        self.spin_parts = ttk.Spinbox(self.frm_top, from_=0, to=10000, textvariable=self.parts_var, width=6)
+        self.spin_parts.grid(row=3, column=1, sticky="w", **pad)
+        _Tooltip(self.spin_parts, lambda: self.tr.t("parts_help"))
+        _Tooltip(self.lbl_parts, lambda: self.tr.t("parts_help"))
 
-        self._clock_timer = QTimer(self)
-        self._clock_timer.timeout.connect(self._update_clock)
-        self._clock_timer.start(1000)
-        self._update_clock()
+        self.parts_actual_var = tk.StringVar(value="")
+        self.lbl_parts_actual = ttk.Label(self.frm_top, textvariable=self.parts_actual_var, style="Muted.TLabel")
+        self.lbl_parts_actual.grid(row=3, column=2, sticky="w", **pad)
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        # Now that the frameless title bar has been laid out, its height is
-        # reliable — reserve the exact space instead of the fixed fallback
-        # used in _build_ui(). Fixes content overlapping the title bar.
+        self.info_var = tk.StringVar(value=self.tr.t("info_default"))
+        self.lbl_info = ttk.Label(self.frm_top, textvariable=self.info_var, style="Muted.TLabel")
+        self.lbl_info.grid(row=2, column=2, columnspan=3, sticky="w", **pad)
+
+        self.frm_top.columnconfigure(1, weight=1)
+
+        frm_actions = ttk.Frame(self)
+        frm_actions.pack(fill="x", **pad)
+
+        self.btn_start = ttk.Button(frm_actions, text=self.tr.t("download_btn"), command=self._on_start)
+        self.btn_start.pack(side="left", padx=4)
+
+        self.btn_cancel = ttk.Button(frm_actions, text=self.tr.t("cancel_btn"), command=self._on_cancel, state="disabled")
+        self.btn_cancel.pack(side="left", padx=4)
+
+        self.btn_open_log = ttk.Button(frm_actions, text=self.tr.t("open_log_btn"), command=self._open_log)
+        self.btn_open_log.pack(side="right", padx=4)
+
+        self.frm_prog = ttk.LabelFrame(self, text=self.tr.t("progress_frame"))
+        self.frm_prog.pack(fill="x", **pad)
+
+        self.progress = ttk.Progressbar(self.frm_prog, orient="horizontal", mode="determinate", length=600)
+        self.progress.pack(fill="x", padx=6, pady=(6, 2))
+
+        self.status_var = tk.StringVar(value=self.tr.t("status_ready"))
+        ttk.Label(self.frm_prog, textvariable=self.status_var).pack(anchor="w", padx=6, pady=(0, 6))
+
+        self.frm_log = ttk.LabelFrame(self, text=self.tr.t("log_frame"))
+        self.frm_log.pack(fill="both", expand=True, **pad)
+
+        self.log_text = tk.Text(self.frm_log, height=16,
+                                 font=("Consolas", 9) if self._font_ok("Consolas") else ("Courier", 9))
+        self.log_text.pack(fill="both", expand=True, side="left", padx=(6, 0), pady=6)
+        scroll = ttk.Scrollbar(self.frm_log, command=self.log_text.yview)
+        scroll.pack(side="right", fill="y", pady=6, padx=(0, 6))
+        self.log_text.configure(yscrollcommand=scroll.set)
+        self.log_text.configure(state="disabled")
+
+        frm_stats = ttk.Frame(self)
+        frm_stats.pack(fill="x", **pad)
+        self.stats_var = tk.StringVar(value="")
+        self.lbl_stats = ttk.Label(frm_stats, textvariable=self.stats_var, style="Muted.TLabel")
+        self.lbl_stats.pack(anchor="w")
+
+    def _update_clock(self):
+        self.clock_var.set(time.strftime("%H:%M:%S"))
+        self.after(1000, self._update_clock)
+
+    def _font_ok(self, name: str) -> bool:
         try:
-            th = int(self.titleBar.height())
-            if th > 0:
-                lay = self.layout()
-                if lay is not None:
-                    lay.setContentsMargins(12, th + 4, 12, 12)
+            import tkinter.font as tkfont
+            return name in tkfont.families()
         except Exception:
-            pass
-
-    # ── UI construction ──
-
-    def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(12, 44, 12, 12)
-        root.setSpacing(8)
-
-        hero = QHBoxLayout()
-        hero.setSpacing(8)
-        self.lbl_hero = QLabel("⚡ RAPID")
-        self.lbl_hero.setObjectName("titleAccent")
-        hero.addWidget(self.lbl_hero)
-        hero.addStretch(1)
-        self.lbl_clock = QLabel("")
-        self.lbl_clock.setObjectName("clock")
-        hero.addWidget(self.lbl_clock)
-        root.addLayout(hero)
-
-        top_card = CardWidget(self)
-        top_bar = QHBoxLayout(top_card)
-        top_bar.setContentsMargins(12, 10, 12, 10)
-        top_bar.setSpacing(8)
-
-        self.lbl_lang = QLabel(self.tr.t("language_label"))
-        top_bar.addWidget(self.lbl_lang)
-        self._lang_codes = self.tr.available()
-        self.lang_combo = ComboBox(top_card)
-        try:
-            self.lang_combo.addItems([name for _, name in self._lang_codes])
-            self.lang_combo.setCurrentText(dict(self._lang_codes).get(self.tr.current, "English"))
-        except Exception:
-            pass
-        self.lang_combo.setMinimumWidth(170)
-        top_bar.addWidget(self.lang_combo)
-
-        self.lbl_theme = QLabel(self.tr.t("theme_label"))
-        top_bar.addWidget(self.lbl_theme)
-        self._theme_codes = self.th.available()
-        self.theme_combo = ComboBox(top_card)
-        try:
-            self.theme_combo.addItems([name for _, name in self._theme_codes])
-            self.theme_combo.setCurrentText(dict(self._theme_codes).get(self.th.current, "Light"))
-        except Exception:
-            pass
-        self.theme_combo.setMinimumWidth(150)
-        top_bar.addWidget(self.theme_combo)
-        top_bar.addStretch(1)
-        self._committed_theme = self.th.current
-        root.addWidget(top_card)
-
-        src_card = CardWidget(self)
-        src_layout = QVBoxLayout(src_card)
-        src_layout.setContentsMargins(12, 10, 12, 10)
-        src_layout.setSpacing(8)
-        self.frm_top_title = QLabel(self.tr.t("source_frame"))
-        self.frm_top_title.setObjectName("muted")
-        src_layout.addWidget(self.frm_top_title)
-
-        url_row = QGridLayout()
-        url_row.setColumnStretch(1, 1)
-        url_row.setVerticalSpacing(10)
-        self.lbl_url = QLabel(self.tr.t("url_label"))
-        url_row.addWidget(self.lbl_url, 0, 0)
-        self.url_edit = LineEdit(src_card)
-        self.url_edit.setPlaceholderText("https://…")
-        self.url_edit.setClearButtonEnabled(True)
-        url_row.addWidget(self.url_edit, 0, 1)
-        self.btn_verify = PushButton(self.tr.t("verify_btn"), src_card)
-        url_row.addWidget(self.btn_verify, 0, 2)
-
-        self.lbl_save_as = QLabel(self.tr.t("save_as_label"))
-        url_row.addWidget(self.lbl_save_as, 1, 0)
-        self.filename_edit = LineEdit(src_card)
-        url_row.addWidget(self.filename_edit, 1, 1)
-        self.btn_browse = PushButton(self.tr.t("browse_btn"), src_card)
-        url_row.addWidget(self.btn_browse, 1, 2)
-
-        self.lbl_workers = QLabel(self.tr.t("workers_label"))
-        url_row.addWidget(self.lbl_workers, 2, 0)
-        self.spin_workers = SpinBox(src_card)
-        try:
-            self.spin_workers.setRange(1, MAX_WORKERS)
-            self.spin_workers.setValue(DEFAULT_WORKERS)
-        except Exception:
-            pass
-        self.spin_workers.setFixedWidth(150)
-        url_row.addWidget(self.spin_workers, 2, 1, Qt.AlignLeft)
-
-        self.lbl_parts = QLabel(self.tr.t("parts_label"))
-        url_row.addWidget(self.lbl_parts, 3, 0)
-        parts_box = QHBoxLayout()
-        parts_box.setContentsMargins(0, 0, 0, 0)
-        parts_box.setSpacing(8)
-        self.spin_parts = SpinBox(src_card)
-        try:
-            self.spin_parts.setRange(0, 10000)
-            self.spin_parts.setValue(0)
-        except Exception:
-            pass
-        self.spin_parts.setFixedWidth(150)
-        parts_box.addWidget(self.spin_parts)
-        self.lbl_parts_actual = QLabel("")
-        self.lbl_parts_actual.setObjectName("muted")
-        parts_box.addWidget(self.lbl_parts_actual)
-        parts_box.addStretch(1)
-        parts_wrap = QWidget(src_card)
-        parts_wrap.setLayout(parts_box)
-        parts_wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        url_row.addWidget(parts_wrap, 3, 1, 1, 2)
-
-        self.lbl_info = QLabel(self.tr.t("info_default"))
-        self.lbl_info.setObjectName("muted")
-        self.lbl_info.setWordWrap(True)
-        url_row.addWidget(self.lbl_info, 4, 0, 1, 3)
-        src_layout.addLayout(url_row)
-        root.addWidget(src_card)
-
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
-        self.btn_start = PrimaryPushButton(self.tr.t("download_btn"))
-        actions.addWidget(self.btn_start)
-        self.btn_cancel = PushButton(self.tr.t("cancel_btn"))
-        try:
-            self.btn_cancel.setEnabled(False)
-        except Exception:
-            pass
-        actions.addWidget(self.btn_cancel)
-        actions.addStretch(1)
-        self.btn_open_log = PushButton(self.tr.t("open_log_btn"))
-        actions.addWidget(self.btn_open_log)
-        root.addLayout(actions)
-
-        prog_card = CardWidget(self)
-        prog_layout = QVBoxLayout(prog_card)
-        prog_layout.setContentsMargins(12, 10, 12, 10)
-        prog_layout.setSpacing(6)
-        self.frm_prog_title = QLabel(self.tr.t("progress_frame"))
-        self.frm_prog_title.setObjectName("muted")
-        prog_layout.addWidget(self.frm_prog_title)
-        self.progress = ProgressBar(prog_card)
-        try:
-            self.progress.setRange(0, 100)
-            self.progress.setValue(0)
-        except Exception:
-            pass
-        prog_layout.addWidget(self.progress)
-        self.lbl_status = QLabel(self.tr.t("status_ready"))
-        prog_layout.addWidget(self.lbl_status)
-        root.addWidget(prog_card)
-
-        log_card = CardWidget(self)
-        log_layout = QVBoxLayout(log_card)
-        log_layout.setContentsMargins(12, 10, 12, 10)
-        log_layout.setSpacing(6)
-        self.frm_log_title = QLabel(self.tr.t("log_frame"))
-        self.frm_log_title.setObjectName("muted")
-        log_layout.addWidget(self.frm_log_title)
-        self.log_text = QTextEdit(log_card)
-        self.log_text.setReadOnly(True)
-        try:
-            mono = QFont("Consolas", 9)
-            mono.setStyleHint(QFont.StyleHint.Monospace)
-            self.log_text.setFont(mono)
-        except Exception:
-            pass
-        log_layout.addWidget(self.log_text, 1)
-        root.addWidget(log_card, 1)
-
-        self.lbl_stats = QLabel("")
-        self.lbl_stats.setObjectName("muted")
-        root.addWidget(self.lbl_stats)
-
-    def _wire_signals(self):
-        try:
-            self.btn_start.clicked.connect(self._on_start)
-            self.btn_cancel.clicked.connect(self._on_cancel)
-            self.btn_verify.clicked.connect(self._on_inspect)
-            self.btn_browse.clicked.connect(self._on_browse)
-            self.btn_open_log.clicked.connect(self._open_log)
-            self.lang_combo.currentTextChanged.connect(self._on_language_change)
-            self.theme_combo.currentTextChanged.connect(self._on_theme_highlight)
-            self.theme_combo.activated.connect(self._on_theme_commit)
-            try:
-                self.theme_combo.popupHidden.connect(self._on_theme_popup_hidden)
-            except Exception:
-                pass
-            try:
-                self.theme_combo.highlighted.connect(self._on_theme_highlighted_index)
-            except Exception:
-                pass
-            self.url_edit.textChanged.connect(self._on_url_changed)
-            self.filename_edit.textChanged.connect(self._on_filename_edited)
-        except Exception as e:
-            self.log.warning(f"Signal wiring incomplete: {e}")
-        try:
-            self._sig_filename.connect(self._set_filename_auto)
-            self._sig_info.connect(self.lbl_info.setText)
-            self._sig_parts.connect(self._set_parts_actual)
-            self._sig_finish.connect(self._finish_on_gui)
-        except Exception as e:
-            self.log.warning(f"Internal signal wiring failed: {e}")
+            return False
 
     # ── Preferences persistence ──
 
@@ -1964,13 +1625,9 @@ class RapidWindow(FluentBaseWidget):
 
     # ── i18n ──
 
-    def _on_language_change(self, _text=None):
+    def _on_language_change(self, _event=None):
         name_to_code = {name: code for code, name in self._lang_codes}
-        try:
-            current_name = self.lang_combo.currentText()
-        except Exception:
-            current_name = ""
-        code = name_to_code.get(current_name, DEFAULT_LANG)
+        code = name_to_code.get(self.lang_var.get(), DEFAULT_LANG)
         self.tr.set_language(code)
         save_app_config(language=code, log=self.log)
         self._retranslate_static_ui()
@@ -1978,93 +1635,37 @@ class RapidWindow(FluentBaseWidget):
     def _retranslate_static_ui(self):
         """Updates all static widget texts after a language change (dynamic
         log/status text keeps whatever language it was generated in)."""
-        try:
-            self.setWindowTitle(self.tr.t("window_title"))
-            self.lbl_lang.setText(self.tr.t("language_label"))
-            self.lbl_theme.setText(self.tr.t("theme_label"))
-            self.frm_top_title.setText(self.tr.t("source_frame"))
-            self.lbl_url.setText(self.tr.t("url_label"))
-            self.btn_verify.setText(self.tr.t("verify_btn"))
-            self.lbl_save_as.setText(self.tr.t("save_as_label"))
-            self.btn_browse.setText(self.tr.t("browse_btn"))
-            self.lbl_workers.setText(self.tr.t("workers_label"))
-            self.lbl_parts.setText(self.tr.t("parts_label"))
-            try:
-                self.spin_workers.setToolTip(self.tr.t("workers_help"))
-                self.lbl_workers.setToolTip(self.tr.t("workers_help"))
-                self.spin_parts.setToolTip(self.tr.t("parts_help"))
-                self.lbl_parts.setToolTip(self.tr.t("parts_help"))
-            except Exception:
-                pass
-            self.btn_start.setText(self.tr.t("download_btn"))
-            self.btn_cancel.setText(self.tr.t("cancel_btn"))
-            self.btn_open_log.setText(self.tr.t("open_log_btn"))
-            self.frm_prog_title.setText(self.tr.t("progress_frame"))
-            self.frm_log_title.setText(self.tr.t("log_frame"))
-            if not self.running and self.state is None:
-                self.lbl_status.setText(self.tr.t("status_ready"))
-            if self.info is None:
-                self.lbl_info.setText(self.tr.t("info_default"))
-        except Exception as e:
-            self.log.debug(f"Retranslate skipped ({e}).")
+        self.title(self.tr.t("window_title"))
+        self.lbl_lang.configure(text=self.tr.t("language_label"))
+        self.lbl_theme.configure(text=self.tr.t("theme_label"))
+        self.frm_top.configure(text=self.tr.t("source_frame"))
+        self.lbl_url.configure(text=self.tr.t("url_label"))
+        self.btn_verify.configure(text=self.tr.t("verify_btn"))
+        self.lbl_save_as.configure(text=self.tr.t("save_as_label"))
+        self.btn_browse.configure(text=self.tr.t("browse_btn"))
+        self.lbl_workers.configure(text=self.tr.t("workers_label"))
+        self.lbl_parts.configure(text=self.tr.t("parts_label"))
+        self.btn_start.configure(text=self.tr.t("download_btn"))
+        self.btn_cancel.configure(text=self.tr.t("cancel_btn"))
+        self.btn_open_log.configure(text=self.tr.t("open_log_btn"))
+        self.frm_prog.configure(text=self.tr.t("progress_frame"))
+        self.frm_log.configure(text=self.tr.t("log_frame"))
+        if not self.running and self.state is None:
+            self.status_var.set(self.tr.t("status_ready"))
+        if self.info is None:
+            self.info_var.set(self.tr.t("info_default"))
 
-    # ── Theming (ThemeManager stays the source of truth; QSS is the consumer) ──
+    # ── Theming ──
 
-    def _on_theme_highlight(self, _text=None):
-        # Live preview while navigating the combo (arrows/hover), no persistence.
-        self._preview_current_combo_theme()
-
-    def _on_theme_highlighted_index(self, _index=None):
-        self._preview_current_combo_theme()
-
-    def _preview_current_combo_theme(self) -> None:
-        try:
-            name = self.theme_combo.currentText()
-        except Exception:
-            return
+    def _on_theme_change(self, _event=None):
         name_to_code = {name: code for code, name in self._theme_codes}
-        code = name_to_code.get(name)
-        if code:
-            self._preview_theme(code)
-
-    def _on_theme_commit(self, _index=None):
-        name_to_code = {name: code for code, name in self._theme_codes}
-        try:
-            name = self.theme_combo.currentText()
-        except Exception:
-            name = ""
-        code = name_to_code.get(name, DEFAULT_THEME)
+        code = name_to_code.get(self.theme_var.get(), DEFAULT_THEME)
         self.th.set_theme(code)
         save_app_config(theme=code, log=self.log)
         self._committed_theme = code
         self._apply_theme()
 
-    def _on_theme_popup_hidden(self) -> None:
-        # If the popup closed without committing, revert the preview.
-        try:
-            name = self.theme_combo.currentText()
-        except Exception:
-            return
-        name_to_code = {name: code for code, name in self._theme_codes}
-        code = name_to_code.get(name)
-        if code is None or code == self._committed_theme:
-            if self.th.current != self._committed_theme:
-                self.th.set_theme(self._committed_theme)
-                self._apply_theme()
-        if code != self._committed_theme and self.th.current != self._committed_theme:
-            try:
-                committed_name = dict(self._theme_codes).get(self._committed_theme, self._committed_theme)
-                self.theme_combo.blockSignals(True)
-                self.theme_combo.setCurrentText(committed_name)
-            except Exception:
-                pass
-            finally:
-                try:
-                    self.theme_combo.blockSignals(False)
-                except Exception:
-                    pass
-            self.th.set_theme(self._committed_theme)
-            self._apply_theme()
+    # ── Theme live preview (arrow keys / mouse hover) ──
 
     def _preview_theme(self, code: str) -> None:
         """Apply theme immediately without persisting to config.cfg (preview)."""
@@ -2075,42 +1676,288 @@ class RapidWindow(FluentBaseWidget):
         self.th.set_theme(code)
         self._apply_theme()
 
-    def _apply_theme(self):
-        c = self.th.colors()
+    def _get_theme_listbox(self):
+        """Return a wrapper for the internal Listbox widget of the theme Combobox popdown, or None.
+
+        The popdown Listbox is created at Tcl level by ttk::combobox, so
+        tkinter's nametowidget cannot find it. We wrap the existing Tcl
+        window path manually (tk.Listbox.__new__) so Python bindings work.
+        """
         try:
-            self.setStyleSheet(build_qss(c))
-        except Exception as e:
-            self.log.debug(f"QSS apply skipped ({e}).")
-        try:
-            if _HAS_FLUENT and _fluent_setTheme is not None and _FluentTheme is not None:
-                _fluent_setTheme(
-                    _FluentTheme.DARK if theme_luminance(c) < 128 else _FluentTheme.LIGHT
-                )
-            if _HAS_FLUENT and _fluent_setThemeColor is not None:
-                _fluent_setThemeColor(QColor(c.get("accent_color", "#3a7bd5")))
-        except Exception as e:
-            self.log.debug(f"Fluent theme sync skipped ({e}).")
-        # Title-bar tint comes straight from the theme (configurable from Python).
-        try:
-            bar = getattr(self, "titleBar", None)
-            if bar is not None:
-                bar.setAttribute(Qt.WA_StyledBackground, True)
-                bar.setStyleSheet(
-                    f"background-color: {c.get('background_color', '#2b2b2b')};"
-                    f"color: {c.get('text_color', '#ffffff')};"
-                )
-                title_lbl = getattr(bar, "titleLabel", None)
-                if title_lbl is not None:
-                    title_lbl.setStyleSheet(
-                        "background: transparent; border: none; text-decoration: none;"
-                    )
+            pop = self.tk.call("ttk::combobox::PopdownWindow", str(self.theme_combo))
+            lb_path = f"{pop}.f.l"
+            if str(self.tk.call("winfo", "exists", lb_path)) != "1":
+                return None
+            lb = tk.Listbox.__new__(tk.Listbox)  # type: ignore
+            lb.master = self  # type: ignore
+            lb._w = lb_path  # type: ignore
+            lb.tk = self.tk  # type: ignore
+            return lb
         except Exception:
             pass
+        return None
+
+    def _get_theme_popdown(self):
+        """Return a wrapper for the popdown Toplevel, or None."""
+        try:
+            pop = self.tk.call("ttk::combobox::PopdownWindow", str(self.theme_combo))
+            if str(self.tk.call("winfo", "exists", pop)) != "1":
+                return None
+            w = tk.Toplevel.__new__(tk.Toplevel)  # type: ignore
+            w.master = self  # type: ignore
+            w._w = pop  # type: ignore
+            w.tk = self.tk  # type: ignore
+            return w
+        except Exception:
+            return None
+
+    def _hook_theme_listbox(self) -> None:
+        lb = self._get_theme_listbox()
+        if lb is None:
+
+            self.after(40, self._hook_theme_listbox)
+            return
+        lb_path = lb._w  # type: ignore
+
+        hooked = getattr(self, "_theme_lb_hooked_paths", set())
+        first_time = lb_path not in hooked
+        if first_time:
+            try:
+                lb.bind("<Motion>", self._on_theme_listbox_hover, add="+")
+            except Exception:
+
+                try:
+                    self.tk.call("bind", lb_path, "<Motion>", f"+{self._on_theme_listbox_hover}")
+                except Exception:
+                    pass
+            hooked.add(lb_path)
+            self._theme_lb_hooked_paths = hooked  # type: ignore
+            self._theme_listbox = lb
+
+            try:
+                pop_w = self._get_theme_popdown()
+                if pop_w is not None:
+                    pop_w.bind("<Unmap>", self._on_theme_popdown_unmap, add="+")
+            except Exception:
+                pass
+
+        self._start_theme_preview_poll()
+
+    def _on_theme_combo_keypress_hook(self, event=None) -> None:
+
+        if event is not None and event.keysym in ("Up", "Down", "Next", "Prior", "Home", "End", "F4", "Alt_L", "Alt_R"):
+            self.after(20, self._hook_theme_listbox)
+
+    def _on_theme_listbox_hover(self, event) -> None:
+        lb = event.widget
+        try:
+            idx = lb.nearest(event.y)
+            if idx < 0:
+                return
+            name = lb.get(idx)
+        except Exception:
+            return
+        name_to_code = {name: code for code, name in self._theme_codes}
+        code = name_to_code.get(name)
+        if code:
+            self._preview_theme(code)
+
+    def _on_theme_key_preview(self, _event=None) -> None:
+
+        self.after(10, self._do_theme_key_preview)
+
+    def _do_theme_key_preview(self) -> None:
+        code = None
+        lb = self._get_theme_listbox()
+        if lb is not None:
+            try:
+                if lb.winfo_ismapped():
+                    sel = lb.curselection()
+                    if sel:
+                        name = lb.get(sel[0])
+                    else:
+                        idx = lb.index("active")
+                        name = lb.get(idx)
+                    name_to_code = {name: code for code, name in self._theme_codes}
+                    code = name_to_code.get(name)
+            except Exception:
+                code = None
+        if code is None:
+            name = self.theme_var.get()
+            name_to_code = {name: code for code, name in self._theme_codes}
+            code = name_to_code.get(name)
+        if code:
+            self._preview_theme(code)
+
+    def _on_theme_preview_revert(self, _event=None) -> None:
+        if self.th.current != self._committed_theme:
+            self.th.set_theme(self._committed_theme)
+            committed_name = dict(self._theme_codes).get(self._committed_theme, self._committed_theme)
+
+            self.theme_var.set(committed_name)
+            self._apply_theme()
+
+    def _on_theme_popdown_unmap(self, _event=None) -> None:
+
+
+
+        pass
+
+    def _start_theme_preview_poll(self) -> None:
+        """Poll active Listbox index while popdown is mapped to catch arrow/hover."""
+        self._poll_theme_preview()
+
+    def _poll_theme_preview(self) -> None:
+        try:
+            pop = self._get_theme_popdown()
+            if pop is None or not pop.winfo_ismapped():  # type: ignore
+                return
+            lb = self._get_theme_listbox()
+            if lb is None:
+                return
+
+            try:
+                if lb.size() == 0:  # type: ignore
+                    self.after(80, self._poll_theme_preview)
+                    return
+
+                idx = lb.index("active")  # type: ignore
+                name = lb.get(idx)  # type: ignore
+                name_to_code = {name: code for code, name in self._theme_codes}
+                code = name_to_code.get(name)
+                if code and code != self.th.current:
+                    self._preview_theme(code)
+            except Exception:
+                pass
+
+            if pop.winfo_ismapped():  # type: ignore
+                self.after(80, self._poll_theme_preview)
+        except Exception:
+            pass
+
+    def _on_theme_focus_out(self, _event=None) -> None:
+
+
+
+        def _check():
+            try:
+                focused = self.focus_get()
+            except Exception:
+                focused = None
+            lb = self._get_theme_listbox()
+
+            try:
+                focused_path = str(focused) if focused is not None else ""
+                lb_path = lb._w if lb is not None else ""  # type: ignore
+                combo_path = str(self.theme_combo)
+                if focused_path in (combo_path, lb_path):
+                    return
+            except Exception:
+                if focused is not None and (focused == self.theme_combo or focused == lb):
+                    return
+
+            if lb is not None:
+                try:
+                    if lb.winfo_ismapped():
+                        return
+                except Exception:
+                    pass
+
+            committed_name = dict(self._theme_codes).get(self._committed_theme, self._committed_theme)
+            if self.theme_var.get() == committed_name and self.th.current != self._committed_theme:
+                self._on_theme_preview_revert()
+        self.after(150, _check)
+
+    def _apply_theme(self):
+        c = self.th.colors()
+        self._apply_style_colors(c)
+
+        theme_lb = getattr(self, "_theme_listbox", None) or self._get_theme_listbox()
+        if theme_lb is not None:
+            try:
+                theme_lb.configure(
+                    background=c["input_background_color"],
+                    foreground=c["input_text_color"],
+                    selectbackground=c["accent_color"],
+                    selectforeground=c["input_background_color"],
+                )
+            except Exception:
+                pass
+
+        self.option_add("*TCombobox*Listbox.background", c["input_background_color"])
+        self.option_add("*TCombobox*Listbox.foreground", c["input_text_color"])
+        self.option_add("*TCombobox*Listbox.selectBackground", c["accent_color"])
+        self.option_add("*TCombobox*Listbox.selectForeground", c["input_background_color"])
 
         if self.th.current == "rgb":
             self._start_rgb_cycle()
         else:
             self._stop_rgb_cycle()
+
+    def _apply_style_colors(self, c: dict) -> None:
+        self.configure(bg=c["background_color"])
+
+        self.style.configure(".", background=c["background_color"], foreground=c["text_color"])
+        self.style.configure("TFrame", background=c["background_color"])
+
+        self.style.configure(
+            "TLabelframe", background=c["background_color"], foreground=c["text_color"],
+            bordercolor=c["border_color"], darkcolor=c["border_color"], lightcolor=c["border_color"],
+        )
+        self.style.configure("TLabelframe.Label", background=c["background_color"], foreground=c["text_color"])
+        self.style.configure("TLabel", background=c["background_color"], foreground=c["text_color"])
+        self.style.configure("Muted.TLabel", background=c["background_color"], foreground=c["secondary_text_color"])
+
+        self.style.configure(
+            "TButton", background=c["button_background_color"], foreground=c["button_text_color"],
+            bordercolor=c["border_color"], darkcolor=c["button_background_color"], lightcolor=c["button_background_color"],
+        )
+        self.style.map(
+            "TButton",
+            background=[("active", c["accent_color"]), ("disabled", c["button_background_color"])],
+            foreground=[("disabled", c["secondary_text_color"])],
+            bordercolor=[("disabled", c["border_color"])],
+        )
+
+        self.style.configure(
+            "TEntry", fieldbackground=c["input_background_color"], foreground=c["input_text_color"],
+            bordercolor=c["border_color"], darkcolor=c["border_color"], lightcolor=c["border_color"],
+            insertcolor=c["input_text_color"],
+        )
+
+        self.style.configure(
+            "TSpinbox", fieldbackground=c["input_background_color"], foreground=c["input_text_color"],
+            background=c["button_background_color"], bordercolor=c["border_color"],
+            darkcolor=c["border_color"], lightcolor=c["border_color"], arrowcolor=c["text_color"],
+            insertcolor=c["input_text_color"],
+        )
+
+        self.style.configure(
+            "TCombobox", fieldbackground=c["input_background_color"], foreground=c["input_text_color"],
+            background=c["button_background_color"], bordercolor=c["border_color"],
+            darkcolor=c["border_color"], lightcolor=c["border_color"], arrowcolor=c["text_color"],
+        )
+        self.style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", c["input_background_color"])],
+            foreground=[("readonly", c["input_text_color"])],
+            background=[("readonly", c["button_background_color"])],
+        )
+
+        self.style.configure(
+            "TProgressbar", background=c["accent_color"], troughcolor=c["button_background_color"],
+            bordercolor=c["border_color"], darkcolor=c["accent_color"], lightcolor=c["accent_color"],
+        )
+
+        self.style.configure(
+            "TScrollbar", background=c["button_background_color"], troughcolor=c["background_color"],
+            bordercolor=c["border_color"], arrowcolor=c["text_color"],
+        )
+        self.style.map("TScrollbar", background=[("active", c["accent_color"])])
+
+        self.log_text.configure(
+            bg=c["log_background_color"], fg=c["log_text_color"], insertbackground=c["log_text_color"],
+        )
 
     # ── RGB Cycle theme — slow and steady ──
 
@@ -2156,49 +2003,64 @@ class RapidWindow(FluentBaseWidget):
         self._rgb_step_deg = max(0.05, min(3.0, step))
 
     def _start_rgb_cycle(self) -> None:
-        if self._rgb_timer.isActive():
+        if self._rgb_job is not None:
             return
         self._refresh_rgb_params()
+
         self._update_rgb_catalog()
-        self._apply_rgb_colors()
-        self._rgb_timer.start(self._rgb_interval_ms)
+        self._rgb_tick()
 
     def _stop_rgb_cycle(self) -> None:
-        try:
-            self._rgb_timer.stop()
-        except Exception:
-            pass
+        if self._rgb_job is not None:
+            try:
+                self.after_cancel(self._rgb_job)
+            except Exception:
+                pass
+            self._rgb_job = None
 
     def _rgb_tick(self) -> None:
         if self.th.current != "rgb":
-            try:
-                self._rgb_timer.stop()
-            except Exception:
-                pass
+            self._rgb_job = None
             return
         self._refresh_rgb_params()
-        try:
-            if self._rgb_timer.interval() != self._rgb_interval_ms:
-                self._rgb_timer.setInterval(self._rgb_interval_ms)
-        except Exception:
-            pass
         self._rgb_hue = (self._rgb_hue + self._rgb_step_deg) % 360
         self._update_rgb_catalog()
-        self._apply_rgb_colors()
 
-    def _apply_rgb_colors(self) -> None:
-        c = self.th.catalogs.get("rgb", self.th.colors())
-        try:
-            self.setStyleSheet(build_qss(c))
-        except Exception:
-            pass
-        try:
-            if _HAS_FLUENT and _fluent_setThemeColor is not None:
-                _fluent_setThemeColor(QColor(c.get("accent_color", "#00e5ff")))
-        except Exception:
-            pass
+        c = self.th.catalogs["rgb"]
+        self._apply_style_colors(c)
 
-    # ── Log view with fade-in ──
+        self._rgb_job = self.after(self._rgb_interval_ms, self._rgb_tick)
+
+    # ── Actions ──
+
+    def _append_log(self, msg: str):
+        c = self.th.colors()
+        bg = c.get("log_background_color", "#000000")
+        fg = c.get("log_text_color", "#dddddd")
+
+        self.log_text.configure(state="normal")
+        start_index = self.log_text.index("end-1c")
+        self.log_text.insert("end", msg + "\n")
+        end_index = self.log_text.index("end-1c")
+
+        tag = f"fade_{self._fade_counter}"
+        self._fade_counter += 1
+        self.log_text.tag_add(tag, start_index, end_index)
+        self.log_text.tag_configure(tag, foreground=bg)
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+        self._fade_step(tag, self._hex_to_rgb(bg), self._hex_to_rgb(fg), 0, 12)
+
+    def _fade_step(self, tag, start_rgb, end_rgb, step, total):
+        t = step / total
+        cur = tuple(s + (e - s) * t for s, e in zip(start_rgb, end_rgb))
+        try:
+            self.log_text.tag_configure(tag, foreground=self._rgb_to_hex(cur))
+        except tk.TclError:
+            return
+        if step < total:
+            self.after(22, lambda: self._fade_step(tag, start_rgb, end_rgb, step + 1, total))
 
     @staticmethod
     def _hex_to_rgb(hexcolor: str):
@@ -2208,42 +2070,6 @@ class RapidWindow(FluentBaseWidget):
     @staticmethod
     def _rgb_to_hex(rgb) -> str:
         return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(v)))) for v in rgb)
-
-    def _append_log(self, msg: str):
-        c = self.th.colors()
-        bg = c.get("log_background_color", "#000000")
-        fg = c.get("log_text_color", "#dddddd")
-        try:
-            cursor = self.log_text.textCursor()
-            cursor.movePosition(QTextCursor.MoveMode.End)
-            block_start = cursor.position()
-            cursor.insertText(msg + "\n")
-            self._fade_step(block_start, cursor.position(), self._hex_to_rgb(bg), self._hex_to_rgb(fg), 0, 12)
-            try:
-                sb = self.log_text.verticalScrollBar()
-                sb.setValue(sb.maximum())
-            except Exception:
-                pass
-        except Exception:
-            try:
-                self.log_text.append(msg)
-            except Exception:
-                pass
-
-    def _fade_step(self, start_pos: int, end_pos: int, start_rgb, end_rgb, step: int, total: int):
-        try:
-            t = step / total
-            cur = tuple(s + (e - s) * t for s, e in zip(start_rgb, end_rgb))
-            fmt = QTextCharFormat()
-            fmt.setForeground(QColor(self._rgb_to_hex(cur)))
-            cursor = self.log_text.textCursor()
-            cursor.setPosition(start_pos)
-            cursor.setPosition(end_pos, QTextCursor.MoveMode.KeepAnchor)
-            cursor.mergeCharFormat(fmt)
-        except Exception:
-            return
-        if step < total:
-            QTimer.singleShot(22, lambda: self._fade_step(start_pos, end_pos, start_rgb, end_rgb, step + 1, total))
 
     def _queue_log(self, msg: str, level: int = logging.INFO) -> None:
         """Log a message — it reaches the GUI automatically via the logger's GUI handler."""
@@ -2259,76 +2085,34 @@ class RapidWindow(FluentBaseWidget):
         counts as the user having picked their own name."""
         self._suppress_filename_trace = True
         try:
-            if self._updating_url_programmatically:
-                return
-            try:
-                self.filename_edit.blockSignals(True)
-            except Exception:
-                pass
-            try:
-                self.filename_edit.setText(value)
-            finally:
-                try:
-                    self.filename_edit.blockSignals(False)
-                except Exception:
-                    pass
+            self.filename_var.set(value)
         finally:
             self._suppress_filename_trace = False
 
-    def _on_filename_edited(self, *_args) -> None:
+    def _on_filename_var_written(self, *_args) -> None:
         if not self._suppress_filename_trace:
             self._filename_user_edited = True
 
     def _on_url_changed(self, *_args) -> None:
-        try:
-            url = self.url_edit.text().strip()
-        except Exception:
-            return
+        url = self.url_var.get().strip()
         if url == self._last_url_for_name:
             return
         self._last_url_for_name = url
         if not self._filename_user_edited:
             self._set_filename_auto("")
             self.info = None
-            try:
-                self.lbl_info.setText(self.tr.t("info_default"))
-            except Exception:
-                pass
-
-    def _update_clock(self):
-        try:
-            self.lbl_clock.setText(time.strftime("%H:%M:%S"))
-        except Exception:
-            pass
-
-    # ── Actions ──
+            self.info_var.set(self.tr.t("info_default"))
 
     def _on_browse(self):
-        try:
-            current = self.filename_edit.text() or "download"
-        except Exception:
-            current = "download"
-        path, _ = QFileDialog.getSaveFileName(self, self.tr.t("save_as_label"), current)
+        path = filedialog.asksaveasfilename(initialfile=self.filename_var.get() or "download")
         if path:
-            try:
-                self.filename_edit.blockSignals(True)
-                self.filename_edit.setText(path)
-            except Exception:
-                pass
-            finally:
-                try:
-                    self.filename_edit.blockSignals(False)
-                except Exception:
-                    pass
+            self.filename_var.set(path)
             self._filename_user_edited = True
 
     def _on_inspect(self):
-        try:
-            url = self.url_edit.text().strip()
-        except Exception:
-            url = ""
+        url = self.url_var.get().strip()
         if not url:
-            _show_warning(self, self.tr.t("app_title"), self.tr.t("warn_need_url_verify"))
+            messagebox.showwarning(self.tr.t("app_title"), self.tr.t("warn_need_url_verify"))
             return
 
         def task():
@@ -2339,19 +2123,13 @@ class RapidWindow(FluentBaseWidget):
                 return
             self.info = info
             if not self._filename_user_edited:
-                try:
-                    self._sig_filename.emit(info.suggested_name)
-                except Exception:
-                    pass
-            try:
-                self._sig_info.emit(self.tr.t(
-                    "info_format",
-                    size=human_size(info.total_bytes),
-                    range=self.tr.t("range_yes") if info.accepts_range else self.tr.t("range_no"),
-                    type=info.content_type,
-                ))
-            except Exception:
-                pass
+                self._set_filename_auto(info.suggested_name)
+            self.info_var.set(self.tr.t(
+                "info_format",
+                size=human_size(info.total_bytes),
+                range=self.tr.t("range_yes") if info.accepts_range else self.tr.t("range_no"),
+                type=info.content_type,
+            ))
             self.log.info(self.tr.t(
                 "verified_msg", url=url, size=human_size(info.total_bytes), range=info.accepts_range,
             ))
@@ -2361,40 +2139,28 @@ class RapidWindow(FluentBaseWidget):
     def _on_start(self):
         if self.running:
             return
-        try:
-            url = self.url_edit.text().strip()
-        except Exception:
-            url = ""
+        url = self.url_var.get().strip()
         if not url:
-            _show_warning(self, self.tr.t("app_title"), self.tr.t("warn_need_url"))
+            messagebox.showwarning(self.tr.t("app_title"), self.tr.t("warn_need_url"))
             return
 
-        try:
-            raw_filename = self.filename_edit.text().strip()
-        except Exception:
-            raw_filename = ""
+        raw_filename = self.filename_var.get().strip()
         auto_name = not self._filename_user_edited
         file_name = raw_filename or unquote(Path(urlparse(url).path).name) or "download"
         self._set_filename_auto(file_name)
+        n_workers = max(1, min(self.workers_var.get(), MAX_WORKERS))
         try:
-            n_workers = max(1, min(int(self.spin_workers.value()), MAX_WORKERS))
-        except Exception:
-            n_workers = DEFAULT_WORKERS
-        try:
-            n_parts = max(0, int(self.spin_parts.value()))
+            n_parts = max(0, int(self.parts_var.get()))
         except Exception:
             n_parts = 0
 
         self.stop_event = threading.Event()
         self.running = True
-        try:
-            self.btn_start.setEnabled(False)
-            self.btn_cancel.setEnabled(True)
-            self.progress.setValue(0)
-            self.lbl_status.setText(self.tr.t("status_checking"))
-            self.lbl_parts_actual.setText("")
-        except Exception:
-            pass
+        self.btn_start.configure(state="disabled")
+        self.btn_cancel.configure(state="normal")
+        self.progress.configure(value=0)
+        self.status_var.set(self.tr.t("status_checking"))
+        self.parts_actual_var.set("")
 
         prevent_sleep(self.log)
 
@@ -2408,17 +2174,14 @@ class RapidWindow(FluentBaseWidget):
             self.stop_event.set()
             self.log.info(self.tr.t("cancel_requested"))
 
-    def closeEvent(self, event):
+    def _on_close(self):
+
         try:
             self._stop_rgb_cycle()
         except Exception:
             pass
         if self.running:
-            if not _ask_yes_no(self, self.tr.t("confirm_close_title"), self.tr.t("confirm_close_msg")):
-                try:
-                    event.ignore()
-                except Exception:
-                    pass
+            if not messagebox.askyesno(self.tr.t("confirm_close_title"), self.tr.t("confirm_close_msg")):
                 return
             self.stop_event.set()
         try:
@@ -2432,10 +2195,7 @@ class RapidWindow(FluentBaseWidget):
                     pass
         except Exception:
             pass
-        try:
-            event.accept()
-        except Exception:
-            pass
+        self.destroy()
 
     def _open_log(self):
         try:
@@ -2449,14 +2209,17 @@ class RapidWindow(FluentBaseWidget):
                     pass
         except Exception:
             pass
-        # Universal Qt opener — same call on every OS.
         try:
-            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(LOG_FILE))):
-                raise RuntimeError("no handler")
+            if sys.platform.startswith("win"):
+                os.startfile(LOG_FILE)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(LOG_FILE)])
+            else:
+                subprocess.Popen(["xdg-open", str(LOG_FILE)])
         except Exception as e:
-            _show_info(self, self.tr.t("log_file_title"), f"{LOG_FILE}\n\n{e}")
+            messagebox.showinfo(self.tr.t("log_file_title"), f"{LOG_FILE}\n\n{e}")
 
-    # ── Download core (unchanged behavior; UI updates via signals) ──
+    # ── Download core ──
 
     def _run_download(self, url: str, file_name: str, n_workers: int, n_parts: int = 0, auto_name: bool = False):
         session = make_session()
@@ -2466,10 +2229,7 @@ class RapidWindow(FluentBaseWidget):
             info = inspect_url(session, url, self.log)
         except Exception as e:
             self.log.error(self.tr.t("error_checking_url", error=e))
-            try:
-                self._sig_finish.emit(False)
-            except Exception:
-                self._finish_on_gui(False)
+            self._finish(success=False)
             return
 
         self.info = info
@@ -2482,10 +2242,7 @@ class RapidWindow(FluentBaseWidget):
 
         if auto_name and info.suggested_name and info.suggested_name != file_name:
             file_name = info.suggested_name
-            try:
-                self._sig_filename.emit(file_name)
-            except Exception:
-                pass
+            self.after(0, lambda fn=file_name: self._set_filename_auto(fn))
 
         if not info.accepts_range or info.total_bytes < MIN_SPLIT_SIZE:
             fresh_chunks = [Chunk(index=0, start=0, end=max(info.total_bytes - 1, 0))]
@@ -2529,10 +2286,9 @@ class RapidWindow(FluentBaseWidget):
             url=url, file_name=file_name, total_bytes=info.total_bytes,
             n_workers=n_workers, chunks=chunks,
         )
-        try:
-            self._sig_parts.emit(len(chunks))
-        except Exception:
-            pass
+        self.after(0, lambda n=len(chunks): self.parts_actual_var.set(
+            self.tr.t("parts_actual_format", n=n)
+        ))
 
         already_done = sum(c.bytes_done for c in chunks)
         if already_done:
@@ -2552,10 +2308,7 @@ class RapidWindow(FluentBaseWidget):
                         f.write(b"\x00")
             except OSError as e:
                 self.log.error(self.tr.t("error_create_file", error=e))
-                try:
-                    self._sig_finish.emit(False)
-                except Exception:
-                    self._finish_on_gui(False)
+                self._finish(success=False)
                 return
             save_state(self.state)
 
@@ -2609,20 +2362,14 @@ class RapidWindow(FluentBaseWidget):
         if self.stop_event.is_set():
             save_state(self.state)
             self.log.info(self.tr.t("cancelled_by_user"))
-            try:
-                self._sig_finish.emit(False)
-            except Exception:
-                self._finish_on_gui(False)
+            self._finish(success=False)
             return
 
         failed = [c.index for c in self.state.chunks if not c.done]
         if failed:
             save_state(self.state)
             self.log.warning(self.tr.t("chunks_incomplete", count=len(failed), list=failed[:10]))
-            try:
-                self._sig_finish.emit(False)
-            except Exception:
-                self._finish_on_gui(False)
+            self._finish(success=False)
             return
 
         try:
@@ -2640,10 +2387,7 @@ class RapidWindow(FluentBaseWidget):
                         self.log.error(f"flatline check: {mismatch_final}")
                     self.log.error(self.tr.t("flatline_suspect"))
                     save_state(self.state)
-                    try:
-                        self._sig_finish.emit(False)
-                    except Exception:
-                        self._finish_on_gui(False)
+                    self._finish(success=False)
                     return
         except Exception as e:
             self.log.debug(f"flatline check skipped ({e})")
@@ -2655,28 +2399,16 @@ class RapidWindow(FluentBaseWidget):
             "download_complete",
             file=file_name, size=human_size(info.total_bytes), elapsed=f"{elapsed:.1f}", speed=f"{avg:.2f}",
         ))
-        try:
-            self._sig_finish.emit(True)
-        except Exception:
-            self._finish_on_gui(True)
+        self._finish(success=True)
 
-    def _set_parts_actual(self, n: int):
-        try:
-            self.lbl_parts_actual.setText(self.tr.t("parts_actual_format", n=n))
-        except Exception:
-            pass
-
-    def _finish_on_gui(self, success: bool):
+    def _finish(self, success: bool):
         allow_sleep(self.log)
         self.running = False
-        try:
-            self.btn_start.setEnabled(True)
-            self.btn_cancel.setEnabled(False)
-            self.lbl_status.setText(self.tr.t("status_done") if success else self.tr.t("status_interrupted"))
-        except Exception:
-            pass
+        self.btn_start.configure(state="normal")
+        self.btn_cancel.configure(state="disabled")
+        self.status_var.set(self.tr.t("status_done") if success else self.tr.t("status_interrupted"))
 
-    # ── Pollers (QTimer replaces tk .after) ──
+    # ── Pollers ──
 
     def _poll_log(self):
         try:
@@ -2685,59 +2417,41 @@ class RapidWindow(FluentBaseWidget):
                 self._log_buffer.append(msg)
         except queue.Empty:
             pass
+        self.after(150, self._poll_log)
 
     def _drain_log_buffer(self):
         if self._log_buffer:
             msg = self._log_buffer.pop(0)
             self._append_log(msg)
-        try:
-            delay = 90 if len(self._log_buffer) < 5 else 20
-            if self._drain_timer.interval() != delay:
-                self._drain_timer.setInterval(delay)
-        except Exception:
-            pass
+        delay = 90 if len(self._log_buffer) < 5 else 20
+        self.after(delay, self._drain_log_buffer)
 
     def _poll_progress(self):
         if self.state is not None:
             n_chunks = len(self.state.chunks)
-            try:
-                self.lbl_parts_actual.setText(self.tr.t("parts_actual_format", n=n_chunks))
-            except Exception:
-                pass
+            self.parts_actual_var.set(self.tr.t("parts_actual_format", n=n_chunks))
         if self.state is not None and self.info is not None and self.info.total_bytes > 0:
             done = self.state.bytes_downloaded
             total = self.info.total_bytes
             pct = min(100.0, done / total * 100)
-            try:
-                self.progress.setValue(int(pct))
-            except Exception:
-                pass
+            self.progress.configure(value=pct)
 
             elapsed = time.monotonic() - self.start_time if self.start_time else 0
             speed = done / elapsed / 1e6 if elapsed > 0 else 0
             remaining = (total - done) / (speed * 1e6) if speed > 0 else 0
 
-            try:
-                self.lbl_status.setText(self.tr.t(
-                    "status_progress", done=human_size(done), total=human_size(total), pct=f"{pct:.1f}",
-                ))
-                self.lbl_stats.setText(self.tr.t(
-                    "stats_line", speed=f"{speed:.2f}", elapsed=f"{elapsed:.0f}", remaining=f"{remaining:.0f}",
-                ))
-            except Exception:
-                pass
+            self.status_var.set(self.tr.t(
+                "status_progress", done=human_size(done), total=human_size(total), pct=f"{pct:.1f}",
+            ))
+            self.stats_var.set(self.tr.t(
+                "stats_line", speed=f"{speed:.2f}", elapsed=f"{elapsed:.0f}", remaining=f"{remaining:.0f}",
+            ))
+        self.after(300, self._poll_progress)
 
 
 def main():
-    app = QApplication.instance() or QApplication(sys.argv)
-    try:
-        app.setOrganizationName("RAPID")
-        app.setApplicationName("RAPID")
-    except Exception:
-        pass
-    win = RapidWindow()
-    win.show()
-    sys.exit(app.exec())
+    app = RapidGUI()
+    app.mainloop()
 
 
 if __name__ == "__main__":

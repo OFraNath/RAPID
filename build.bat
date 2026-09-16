@@ -9,7 +9,7 @@ if exist RAPID.spec del /q RAPID.spec
 if exist RAPID.exe del /q RAPID.exe
 
 echo [2/6] Installing/Updating build and UI dependencies...
-pip install --upgrade pyinstaller PySide6 PySide6-Fluent-Widgets requests urllib3 curl_cffi >nul 2>&1
+pip install --upgrade pyinstaller requests urllib3 curl_cffi >nul 2>&1
 
 echo [3/6] Checking RAPID.pyw syntax...
 python -m py_compile RAPID.pyw
@@ -19,8 +19,8 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [4/6] Generating RAPID.exe (Qt/Fluent)...
-pyinstaller --onefile --windowed --name RAPID --add-data "languages;languages" --add-data "themes;themes" --collect-all PySide6 --collect-all qfluentwidgets --collect-all PySideSix_Frameless_Window --collect-all darkdetect --clean RAPID.pyw
+echo [4/6] Making RAPID.exe...
+pyinstaller --onefile --windowed --name RAPID --add-data "languages;languages" --add-data "themes;themes" --clean RAPID.pyw
 
 echo.
 if not exist dist\RAPID.exe (
@@ -39,5 +39,4 @@ if exist RAPID.spec del /q RAPID.spec
 
 echo.
 echo === Build completed! ===
-echo Executable: RAPID.exe
 pause
