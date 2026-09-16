@@ -1,7 +1,7 @@
 # RAPID
 <b>Reliable Asynchronous Parallel Internet Downloader</b>
 
-This is a project I made myself for my own use; don't demand updates or features. Just give me suggestions or complain in the Issues tab.
+This is a project I made for my own use; don't demand updates or features. Just give me suggestions or complain in the Issues tab.
 
 The only thing I can guarantee is that bugs will be fixed. I hope it will be as useful and amazing to whoever uses it as it is to me. The goal of this tool is to do the good part of IDM, which is to download things quickly, and on top of that, for free, forever.
 
