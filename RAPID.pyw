@@ -1603,9 +1603,9 @@ class RapidGUI(tk.Tk):
     def _refresh_window_icon(self) -> None:
         try:
             try:
-                fg = self.th.colors().get("accent_color", "#2f7bd5")
+                fg = self.th.colors().get("accent_color", "#ff8a1f")
             except Exception:
-                fg = "#2f7bd5"
+                fg = "#ff8a1f"
             icon = self._build_swap_icon(size=64, color=fg)
             self.iconphoto(False, icon)
             self._swap_icon = icon
@@ -1613,7 +1613,7 @@ class RapidGUI(tk.Tk):
             pass
 
     @staticmethod
-    def _build_swap_icon(size: int = 64, color: str = "#2f7bd5") -> "tk.PhotoImage":
+    def _build_swap_icon(size: int = 64, color: str = "#ff8a1f") -> "tk.PhotoImage":
         img = tk.PhotoImage(width=size, height=size)
         y_top = int(size * 0.38)
         y_bot = int(size * 0.62)
