@@ -1424,6 +1424,8 @@ class RapidGUI(tk.Tk):
         self.title(self.tr.t("window_title"))
         self.geometry("640x560")
         self.resizable(False, False)
+        self._swap_icon = None
+        self._refresh_window_icon()
 
         self.stop_event = threading.Event()
         self.download_thread: Optional[threading.Thread] = None
@@ -1597,6 +1599,54 @@ class RapidGUI(tk.Tk):
             return name in tkfont.families()
         except Exception:
             return False
+
+    def _refresh_window_icon(self) -> None:
+        try:
+            try:
+                fg = self.th.colors().get("accent_color", "#2f7bd5")
+            except Exception:
+                fg = "#2f7bd5"
+            icon = self._build_swap_icon(size=64, color=fg)
+            self.iconphoto(False, icon)
+            self._swap_icon = icon
+        except Exception:
+            pass
+
+    @staticmethod
+    def _build_swap_icon(size: int = 64, color: str = "#2f7bd5") -> "tk.PhotoImage":
+        img = tk.PhotoImage(width=size, height=size)
+        y_top = int(size * 0.38)
+        y_bot = int(size * 0.62)
+        x_left = int(size * 0.14)
+        x_right = int(size * 0.86)
+        thick = max(4, size // 14)
+        barb_len = int(size * 0.28)
+        barb_drop = int(barb_len * 0.45)
+
+        def dot(cx: int, cy: int, r: int) -> None:
+            x0 = max(0, cx - r)
+            y0 = max(0, cy - r)
+            x1 = min(size - 1, cx + r)
+            y1 = min(size - 1, cy + r)
+            try:
+                img.put(color, to=(x0, y0, x1 + 1, y1 + 1))
+            except Exception:
+                pass
+
+        def line(x0: int, y0: int, x1: int, y1: int, w: int) -> None:
+            dx = abs(x1 - x0)
+            dy = abs(y1 - y0)
+            steps = max(dx, dy) or 1
+            r = max(0, w // 2)
+            for i in range(steps + 1):
+                t = i / steps
+                dot(round(x0 + (x1 - x0) * t), round(y0 + (y1 - y0) * t), r)
+
+        line(x_left, y_top, x_right, y_top, thick)
+        line(x_right, y_top, x_right - barb_len, y_top - barb_drop, thick)
+        line(x_left, y_bot, x_right, y_bot, thick)
+        line(x_left, y_bot, x_left + barb_len, y_bot + barb_drop, thick)
+        return img
 
     # ── Preferences persistence ──
 
@@ -1893,6 +1943,8 @@ class RapidGUI(tk.Tk):
             self._start_rgb_cycle()
         else:
             self._stop_rgb_cycle()
+
+        self._refresh_window_icon()
 
     def _apply_style_colors(self, c: dict) -> None:
         self.configure(bg=c["background_color"])

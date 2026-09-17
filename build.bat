@@ -20,7 +20,8 @@ if errorlevel 1 (
 )
 
 echo [4/6] Making RAPID.exe...
-pyinstaller --onefile --windowed --name RAPID --add-data "languages;languages" --add-data "themes;themes" --clean RAPID.pyw
+if not exist icons\icon.ico echo WARNING: icons\icon.ico not found, exe will use default icon
+pyinstaller --onefile --windowed --name RAPID --icon=icons\icon.ico --add-data "languages;languages" --add-data "themes;themes" --clean RAPID.pyw
 
 echo.
 if not exist dist\RAPID.exe (
