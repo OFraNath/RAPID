@@ -6,16 +6,21 @@ from __future__ import annotations
 
 import colorsys
 import configparser
+import hashlib
 import importlib
 import importlib.util
 import logging
 import subprocess
 import sys
 import os
+import re
+import socket
+import ssl
+import shutil
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys.executable).resolve().parent
 else:
@@ -33,17 +38,14 @@ CONFIG_FILE = BASE_DIR / "config.cfg"
 
 
 class _FlushRotatingFileHandler(RotatingFileHandler):
-    """RotatingFileHandler that fsyncs after every emit for real-time persistence."""
 
     def emit(self, record: logging.LogRecord) -> None:
+        
+        
         super().emit(record)
         try:
             if self.stream:
                 self.stream.flush()
-                try:
-                    os.fsync(self.stream.fileno())
-                except Exception:
-                    pass
         except Exception:
             pass
 
@@ -79,7 +81,7 @@ def setup_logging(debug: bool = False, clear: bool = False) -> logging.Logger:
     return log
 
 
-_EARLY_LOG = setup_logging(clear=True)
+_EARLY_LOG = setup_logging(clear=False)
 
 
 class _GuiQueueHandler(logging.Handler):
@@ -157,12 +159,9 @@ try:
 except Exception:
     pass
 
-# ─────────────────────────────────────────────────────────────────────────────
 
 _THIRD_PARTY_PACKAGES = {
     "requests": "requests",
-    "urllib3":  "urllib3",
-    "curl_cffi": "curl_cffi",
 }
 
 
@@ -231,6 +230,31 @@ def _check_tkinter() -> None:
 _check_tkinter()
 _ensure_dependencies()
 
+
+if importlib.util.find_spec("truststore") is None:
+    try:
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "--quiet",
+            "--disable-pip-version-check", "--timeout", "8", "--retries", "1", "truststore",
+        ], timeout=20)
+        importlib.invalidate_caches()
+    except Exception as _truststore_install_error:
+        _EARLY_LOG.warning(
+            "Could not install optional truststore integration. The app will use its configured CA bundle; "
+            "a custom CA can be supplied through REQUESTS_CA_BUNDLE or SSL_CERT_FILE. "
+            f"Reason: {_truststore_install_error}"
+        )
+try:
+    import truststore
+    truststore.inject_into_ssl()
+    _EARLY_LOG.info("TLS trust: operating-system certificate store enabled (truststore)")
+except Exception as _truststore_error:
+    _EARLY_LOG.warning(
+        "TLS truststore integration unavailable; using Python's configured CA bundle. "
+        "A custom CA can be supplied through REQUESTS_CA_BUNDLE or SSL_CERT_FILE. "
+        f"Reason: {_truststore_error}"
+    )
+
 import json
 import locale
 import queue
@@ -248,13 +272,11 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ─────────────────────────────────────────────────────────────────────────────
 
-_caffeinate_proc = None  # type: ignore[assignment]
+_caffeinate_proc = None  
 
 
 def prevent_sleep(log: "logging.Logger") -> None:
-    """Ask the OS not to sleep/turn off the display while downloading."""
     global _caffeinate_proc
     try:
         if sys.platform.startswith("win"):
@@ -289,7 +311,6 @@ def prevent_sleep(log: "logging.Logger") -> None:
 
 
 def allow_sleep(log: "logging.Logger") -> None:
-    """Undo prevent_sleep() once a download finishes/cancels/fails."""
     global _caffeinate_proc
     try:
         if sys.platform.startswith("win"):
@@ -307,23 +328,17 @@ def allow_sleep(log: "logging.Logger") -> None:
         log.debug(f"allow_sleep: could not release sleep inhibitor ({e}), continuing.")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Configuration
-# ─────────────────────────────────────────────────────────────────────────────
-
-DEFAULT_WORKERS = 16
-MAX_WORKERS     = 64
+DEFAULT_WORKERS = 8
+MAX_WORKERS     = 32
 CHUNK_SIZE      = 1  * 1024 * 1024
 CHUNK_PART_SIZE = 64 * 1024 * 1024
 MIN_SPLIT_SIZE  = 4  * 1024 * 1024
-MAX_RETRIES     = 3
-CONNECT_TIMEOUT = 15
-READ_TIMEOUT    = 45
-WRITE_BUF_SIZE  = 4  * 1024 * 1024
-SNIFF_SIZE       = 512
+MAX_RETRIES     = 4
+CONNECT_TIMEOUT = 20
+READ_TIMEOUT    = 60
+WRITE_BUF_SIZE  = 8  * 1024 * 1024
 PROBE_RANGE_SIZE = 1023
 PROBE_SMALL_SIZE = 1023
-FLATLINE_MIN_BYTES = 10 * 1024
 MAX_ROUNDS       = 3
 UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -331,7 +346,6 @@ UA_POOL = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
 ]
-HTML_MARKERS = (b"<!doctype", b"<html", b"<head", b"<script")
 WAF_BODY_MARKERS = (
     b"checking your browser", b"challenge-platform", b"captcha",
     b"cf-challenge", b"just a moment", b"attention required",
@@ -341,88 +355,9 @@ CHALLENGE_DOMAINS = (
     "challenges.cloudflare.com", "accounts.google.com",
     "www.google.com/recaptcha", "/cdn-cgi/challenge",
 )
-BINARY_EXTS = frozenset({
-    ".mp4", ".mkv", ".avi", ".mov", ".iso", ".zip", ".rar", ".7z",
-    ".exe", ".msi", ".mp3", ".flac", ".pdf", ".tar", ".gz", ".bin",
-})
 
-MAGIC_SIGNATURES: dict[str, list[tuple[int, bytes]]] = {
-    "pdf":   [(0, b"%PDF-")],
-    "rtf":   [(0, b"{\\rtf1")],
-    "ole":   [(0, b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")],
-    "zip":   [(0, b"PK\x03\x04"), (0, b"PK\x05\x06"), (0, b"PK\x07\x08")],
-    "rar":   [(0, b"Rar!\x1a\x07\x00"), (0, b"Rar!\x1a\x07\x01\x00")],
-    "7z":    [(0, b"7z\xbc\xaf\x27\x1c")],
-    "gzip":  [(0, b"\x1f\x8b")],
-    "bzip2": [(0, b"BZh")],
-    "xz":    [(0, b"\xfd7zXZ\x00")],
-    "zstd":  [(0, b"\x28\xb5\x2f\xfd")],
-    "tar":   [(257, b"ustar")],
-    "iso":   [(0x8001, b"CD001"), (0x8801, b"CD001"), (0x9001, b"CD001")],
-    "cab":   [(0, b"MSCF")],
-    "exe":   [(0, b"MZ")],
-    "elf":   [(0, b"\x7fELF")],
-    "macho": [(0, b"\xfe\xed\xfa\xce"), (0, b"\xfe\xed\xfa\xcf"),
-              (0, b"\xca\xfe\xba\xbe")],
-    "mp3":   [(0, b"ID3"), (0, b"\xff\xfb"), (0, b"\xff\xf3"), (0, b"\xff\xf2")],
-    "flac":  [(0, b"fLaC")],
-    "wav":   [(0, b"RIFF")],
-    "ogg":   [(0, b"OggS")],
-    "midi":  [(0, b"MThd")],
-    "ape":   [(0, b"MAC ")],
-    "ftyp":  [(4, b"ftyp")],
-    "mkv":   [(0, b"\x1a\x45\xdf\xa3")],
-    "avi":   [(0, b"RIFF")],
-    "wmv":   [(0, b"\x30\x26\xb2\x75\x8e\x66\xcf\x11")],
-    "flv":   [(0, b"FLV\x01")],
-    "png":   [(0, b"\x89PNG\r\n\x1a\n")],
-    "jpg":   [(0, b"\xff\xd8\xff")],
-    "gif":   [(0, b"GIF87a"), (0, b"GIF89a")],
-    "bmp":   [(0, b"BM")],
-    "webp":  [(0, b"RIFF")],
-    "ico":   [(0, b"\x00\x00\x01\x00")],
-    "heic":  [(4, b"ftypheic"), (4, b"ftypheix"), (4, b"ftypmif1")],
-    "tiff":  [(0, b"II*\x00"), (0, b"MM\x00*")],
-    "ttf":   [(0, b"\x00\x01\x00\x00"), (0, b"true")],
-    "otf":   [(0, b"OTTO")],
-    "woff":  [(0, b"wOFF")],
-    "woff2": [(0, b"wOF2")],
-}
-_RIFF_SUBTYPES = {b"WAVE": "wav", b"AVI ": "avi", b"WEBP": "webp"}
-_EXT_FAMILY = {
-    ".pdf": {"pdf"}, ".rtf": {"rtf"},
-    ".doc": {"ole"}, ".xls": {"ole"}, ".ppt": {"ole"}, ".msi": {"ole", "exe"},
-    ".zip": {"zip"}, ".docx": {"zip"}, ".xlsx": {"zip"}, ".pptx": {"zip"},
-    ".apk": {"zip"}, ".jar": {"zip"},
-    ".rar": {"rar"}, ".7z": {"7z"}, ".gz": {"gzip"}, ".tgz": {"gzip"},
-    ".bz2": {"bzip2"}, ".xz": {"xz"}, ".zst": {"zstd"}, ".tar": {"tar"},
-    ".iso": {"iso"}, ".cab": {"cab"},
-    ".exe": {"exe"}, ".dll": {"exe"}, ".elf": {"elf"}, ".bin": {"exe", "elf"},
-    ".mp3": {"mp3"}, ".flac": {"flac"}, ".wav": {"wav"}, ".ogg": {"ogg"},
-    ".mid": {"midi"}, ".ape": {"ape"},
-    ".mp4": {"ftyp"}, ".m4a": {"ftyp"}, ".m4v": {"ftyp"}, ".mov": {"ftyp"},
-    ".3gp": {"ftyp"}, ".heic": {"ftyp", "heic"},
-    ".mkv": {"mkv"}, ".webm": {"mkv"}, ".avi": {"avi"},
-    ".wmv": {"wmv"}, ".wma": {"wmv"}, ".flv": {"flv"},
-    ".png": {"png"}, ".jpg": {"jpg"}, ".jpeg": {"jpg"}, ".gif": {"gif"},
-    ".bmp": {"bmp"}, ".webp": {"webp"}, ".ico": {"ico"}, ".tif": {"tiff"},
-    ".tiff": {"tiff"}, ".ttf": {"ttf"}, ".otf": {"otf"},
-    ".woff": {"woff"}, ".woff2": {"woff2"},
-}
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# i18n — translation loader
-# ─────────────────────────────────────────────────────────────────────────────
 
 class Translator:
-    """
-    Loads *.language files from LANGUAGES_DIR (flat JSON key -> string).
-    Each file's code is its filename stem (e.g. "pt-br.language" -> "pt-br").
-    English is now loaded from languages/en.language like any other language.
-    Fallback is DEFAULT_LANG catalog, then key name.
-    """
 
     def __init__(self, languages_dir: Path, log: Optional[logging.Logger] = None):
         self.languages_dir = languages_dir
@@ -457,7 +392,6 @@ class Translator:
             self.display_names[code] = display_name
 
     def available(self) -> list[tuple[str, str]]:
-        """Returns list of (code, display_name), English first, then alphabetical."""
         codes = sorted(self.catalogs.keys(), key=lambda c: (c != "en", self.display_names.get(c, c)))
         return [(c, self.display_names.get(c, c)) for c in codes]
 
@@ -485,11 +419,6 @@ class Translator:
         return template
 
     def autodetect(self) -> str:
-        """
-        Tries to guess the system's language and returns the best matching
-        available code (falling back to DEFAULT_LANG if nothing matches).
-        Does not change self.current — call set_language() with the result.
-        """
         candidates: list[str] = []
         try:
             for getter in (locale.getlocale, locale.getdefaultlocale):
@@ -525,10 +454,6 @@ class Translator:
         return DEFAULT_LANG
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Theming — theme loader
-# ─────────────────────────────────────────────────────────────────────────────
-
 _BUILTIN_LIGHT = {
     "_meta_name": "Light",
     "background_color":        "#f0f0f0",
@@ -547,17 +472,10 @@ _BUILTIN_LIGHT = {
 THEME_KEYS = [k for k in _BUILTIN_LIGHT if k != "_meta_name"]
 
 
-
 CYCLE_KEYS = ["cycle_interval_ms", "cycle_step_deg"]
 
 
 class ThemeManager:
-    """
-    Loads *.theme files from THEMES_DIR (flat JSON key -> hex color string).
-    Each file's code is its filename stem (e.g. "dark.theme" -> "dark").
-    The built-in "light" theme is always available and is used as the
-    fallback for any missing file or missing key in any theme.
-    """
 
     def __init__(self, themes_dir: Path, log: Optional[logging.Logger] = None):
         self.themes_dir = themes_dir
@@ -604,14 +522,6 @@ class ThemeManager:
                 self.cycle_params[code] = cycle_cfg
 
     def available(self) -> list[tuple[str, str]]:
-        """Returns list of (code, display_name) ordered for preview:
-
-        Light is always first (default), RGB Cycle always last (animated),
-        then remaining themes sorted by background luminance (bright → dark).
-        This groups light themes together and dark themes together, so
-        arrow Up/Down and hover preview feel like a smooth light-to-dark
-        sweep instead of random alphabetical jumps.
-        """
         def _lum(code: str) -> float:
             hx = self.catalogs[code].get("background_color", "#808080").lstrip("#")
             try:
@@ -641,13 +551,7 @@ class ThemeManager:
         return self.catalogs.get(self.current, _BUILTIN_LIGHT)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# App config — persists theme / language to config.cfg
-# ─────────────────────────────────────────────────────────────────────────────
-
 def load_app_config(log: Optional[logging.Logger] = None) -> dict[str, str]:
-    """Load Preferences from CONFIG_FILE. Returns dict with optional keys:
-    'theme', 'language'. Missing/invalid file -> empty dict."""
     if not CONFIG_FILE.is_file():
         return {}
     parser = configparser.ConfigParser()
@@ -686,8 +590,6 @@ def save_app_config(
     language: Optional[str] = None,
     log: Optional[logging.Logger] = None,
 ) -> None:
-    """Persist given preferences to CONFIG_FILE. Only provided values are updated;
-    existing unrelated keys are preserved. Atomic write via temp file + replace."""
     parser = configparser.ConfigParser()
     if CONFIG_FILE.is_file():
         try:
@@ -712,10 +614,6 @@ def save_app_config(
             log.warning(f"Failed to save config.cfg: {e}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Structures
-# ─────────────────────────────────────────────────────────────────────────────
-
 @dataclass
 class Chunk:
     index: int
@@ -723,6 +621,7 @@ class Chunk:
     end:   int
     done:  bool = False
     bytes_done: int = 0
+    sha256: str = ""
 
     @property
     def size(self) -> int:
@@ -737,22 +636,22 @@ class DownloadState:
     n_workers:   int
     chunks:      list = field(default_factory=list)
 
-    _lock:       threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
-    _bytes_done: int            = field(default=0, repr=False, compare=False)
+    _lock:       threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
+    _bytes_done: int = field(default=0, repr=False, compare=False)
+    range_error: Optional[str] = field(default=None, repr=False, compare=False)
+    fatal_error: Optional[str] = field(default=None, repr=False, compare=False)
+    dns_errors: int = field(default=0, repr=False, compare=False)
 
     def record_bytes(self, n: int) -> None:
+        
         with self._lock:
-            self._bytes_done += n
+            self._bytes_done = max(0, self._bytes_done + int(n))
 
     @property
     def bytes_downloaded(self) -> int:
         with self._lock:
             return self._bytes_done
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Resume state persistence
-# ─────────────────────────────────────────────────────────────────────────────
 
 STATE_SUFFIX = ".rapidstate"
 
@@ -763,21 +662,41 @@ def _state_path(file_name: str) -> Path:
 
 def save_state(state: "DownloadState") -> None:
     path = _state_path(state.file_name)
-    data = {
-        "url": state.url,
-        "file_name": state.file_name,
-        "total_bytes": state.total_bytes,
-        "chunks": [
-            {"index": c.index, "start": c.start, "end": c.end, "done": c.done, "bytes_done": c.bytes_done}
-            for c in state.chunks
-        ],
-    }
     try:
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(data), encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        pass
+        
+        
+        with state._lock:
+            data = {
+                "version": 2,
+                
+                
+                "url_sha256": hashlib.sha256(state.url.encode("utf-8")).hexdigest(),
+                "file_name": state.file_name,
+                "total_bytes": state.total_bytes,
+                "chunks": [
+                    {
+                        "index": c.index,
+                        "start": c.start,
+                        "end": c.end,
+                        "done": bool(c.done),
+                        "bytes_done": int(c.bytes_done),
+                        "sha256": str(c.sha256 or ""),
+                    }
+                    for c in state.chunks
+                ],
+            }
+            tmp = path.with_name(
+                path.name + f".{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+    except OSError as e:
+        _EARLY_LOG.warning(
+            f"Could not persist resume state for {Path(state.file_name).name}: {e}"
+        )
 
 
 def load_state(file_name: str) -> Optional[dict]:
@@ -785,17 +704,68 @@ def load_state(file_name: str) -> Optional[dict]:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
     except Exception:
         return None
 
 
 def clear_state(file_name: str) -> None:
     path = _state_path(file_name)
+    for candidate in (path, path.with_name(path.name + ".tmp")):
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
+    for candidate in path.parent.glob(path.name + ".*.tmp"):
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _saved_state_matches(saved: Optional[dict], fresh_chunks: list[Chunk], url: str,
+                         total_bytes: int, file_name: str) -> bool:
+    if not isinstance(saved, dict):
+        return False
     try:
-        path.unlink(missing_ok=True)
-    except Exception:
-        pass
+        saved_fingerprint = saved.get("url_sha256")
+        if saved_fingerprint:
+            current_fingerprint = hashlib.sha256(url.encode("utf-8")).hexdigest()
+            if saved_fingerprint != current_fingerprint:
+                return False
+        elif saved.get("url") != url:  
+            return False
+        if int(saved.get("total_bytes", -1)) != total_bytes:
+            return False
+        if saved.get("file_name") and Path(str(saved["file_name"])).resolve() != Path(file_name).resolve():
+            return False
+        old = saved.get("chunks")
+        if not isinstance(old, list) or len(old) != len(fresh_chunks):
+            return False
+        for item, fresh in zip(old, fresh_chunks):
+            if not isinstance(item, dict):
+                return False
+            if (int(item.get("index", -1)) != fresh.index
+                    or int(item.get("start", -1)) != fresh.start
+                    or int(item.get("end", -1)) != fresh.end):
+                return False
+            done = bool(item.get("done", False))
+            count = int(item.get("bytes_done", 0))
+            if count < 0 or count > fresh.size:
+                return False
+            if done and count != fresh.size:
+                return False
+            saved_hash = str(item.get("sha256", ""))
+            if (done or count > 0) and not re.fullmatch(r"[0-9a-f]{64}", saved_hash):
+                return False
+            if count == 0 and saved_hash:
+                return False
+            if not done and count == fresh.size:
+                return False
+        return Path(file_name).is_file() and Path(file_name).stat().st_size == total_bytes
+    except (OSError, TypeError, ValueError, KeyError):
+        return False
 
 
 @dataclass
@@ -806,81 +776,59 @@ class ServerInfo:
     content_type:   str
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Content validation + WAF/CDN block detection
-# ─────────────────────────────────────────────────────────────────────────────
+class RangeProtocolError(RuntimeError):
+    pass
 
-def looks_like_html(data: bytes) -> bool:
+
+class IncompleteDownloadError(RuntimeError):
+    pass
+
+
+class ServerBlockedError(RuntimeError):
+    pass
+
+
+def _safe_url_for_log(url: str) -> str:
     try:
-        head = data[:SNIFF_SIZE].lstrip()[:512].lower()
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return f"{parsed.scheme}://{host}{parsed.path}"
     except Exception:
-        return False
-    return any(m in head for m in HTML_MARKERS)
+        return "<URL redacted>"
 
 
-def _expected_binary(content_type: str, filename: str) -> bool:
-    ct = (content_type or "").lower()
-    if "html" in ct:
-        return False
-    ext = "." + (filename.rsplit(".", 1)[-1].lower() if "." in filename else "")
-    if ext in BINARY_EXTS:
-        return True
-    if ct.startswith(("video/", "audio/")):
-        return True
-    if ct in ("application/octet-stream", "application/pdf",
-              "application/zip", "application/x-iso9660-image",
-              "application/x-msdownload"):
-        return True
-    if ct.startswith("application/") and "json" not in ct and "xml" not in ct and "text" not in ct:
-        return True
-    return False
+def _redact_error(error: object, url: str) -> str:
+    message = str(error)
+    if url:
+        message = message.replace(url, _safe_url_for_log(url))
+    
+    
+    message = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?<query redacted>", message)
+    message = re.sub(r"(?i)(url:\s*[^?\s]+)\?[^\s]+", r"\1?<query redacted>", message)
+    return message
 
 
-def sniff_format(data: bytes) -> Optional[str]:
-    """Best-effort magic-byte sniff. Returns a family name from
-    MAGIC_SIGNATURES (e.g. 'zip', 'ftyp', 'png') or None if nothing matched.
-    Never raises — a sniff failure just means 'unknown', not 'html'."""
-    try:
-        if not data:
-            return None
-        for family, sigs in MAGIC_SIGNATURES.items():
-            for offset, sig in sigs:
-                if len(data) >= offset + len(sig) and data[offset:offset + len(sig)] == sig:
-                    if family in ("wav", "avi", "webp"):
-                        sub = data[8:12]
-                        resolved = _RIFF_SUBTYPES.get(sub)
-                        if resolved:
-                            return resolved
-                        continue  # RIFF but unknown subtype: don't claim a false family
-                    return family
+def _safe_filename(name: str) -> str:
+    name = unquote(str(name or "")).replace("\\", "/")
+    name = Path(name).name
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    if not name:
+        return "download"
+    if name.upper().split(".")[0] in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+        name = f"_{name}"
+    return name[:240]
+
+
+def _parse_content_range(value: str) -> Optional[tuple[int, int, int]]:
+    match = re.fullmatch(r"\s*bytes\s+(\d+)-(\d+)/(\d+)\s*", str(value or ""), re.I)
+    if not match:
         return None
-    except Exception:
+    start, end, total = map(int, match.groups())
+    if start < 0 or end < start or total <= end:
         return None
-
-
-def magic_mismatch(data: bytes, filename: str, content_type: str) -> Optional[str]:
-    """Phase 1.1 (extended) — compare sniffed magic bytes against what the
-    extension/content-type promised. Returns a human-readable reason string
-    if there's a confident contradiction, or None if OK / inconclusive.
-
-    Deliberately conservative: only fires when we positively identified a
-    *different* known binary family than the one implied by the filename —
-    an unmatched/unknown sniff is never treated as a mismatch, since many
-    legitimate files won't hit any signature in the table.
-    """
-    try:
-        ext = "." + (filename.rsplit(".", 1)[-1].lower() if "." in filename else "")
-        expected_families = _EXT_FAMILY.get(ext)
-        if not expected_families:
-            return None  # unknown extension: nothing to compare against
-        detected = sniff_format(data)
-        if detected is None:
-            return None  # inconclusive: don't flag on lack of a match
-        if detected in expected_families:
-            return None
-        return f"expected '{ext}' ({'/'.join(sorted(expected_families))}) but content sniffs as '{detected}'"
-    except Exception:
-        return None
+    return start, end, total
 
 
 def _body_indicates_block(peek: bytes) -> bool:
@@ -892,7 +840,6 @@ def _body_indicates_block(peek: bytes) -> bool:
 
 
 def is_block_response(resp, peek: bytes | None = None) -> tuple[bool, str]:
-    """Classify a response as WAF/CDN challenge vs. plain HTTP. Returns (blocked, reason)."""
     try:
         headers = {str(k).lower(): str(v) for k, v in dict(getattr(resp, "headers", {}) or {}).items()}
     except Exception:
@@ -908,442 +855,517 @@ def is_block_response(resp, peek: bytes | None = None) -> tuple[bool, str]:
     if any(k.startswith("x-akamai-") and "bot" in str(v).lower() for k, v in headers.items()):
         return True, "akamai bot header"
     if any(d in final_url for d in CHALLENGE_DOMAINS):
-        return True, f"redirect to challenge ({final_url[:80]})"
-    body = peek if peek is not None else b""
-    if body and _body_indicates_block(body):
+        return True, "redirect to challenge page"
+    if peek and _body_indicates_block(peek):
         return True, "challenge marker in body"
     return False, ""
 
 
-def pick_ua(attempt: int, blocked: bool) -> str:
-    if not blocked:
-        return "Reliable Asynchronous Parallel Internet Downloader"
-    try:
-        return UA_POOL[(max(1, attempt) - 1) % len(UA_POOL)]
-    except Exception:
-        return UA_POOL[0]
-
-
-def make_session():
-    """Phase 4 — prefer curl_cffi (browser TLS fingerprint), fallback to requests.
-
-    Keeps the requests-compatible surface used by worker()/inspect_url():
-    .get/.head(stream/timeout/headers), .headers, resp.(status_code/headers/url/
-    iter_content/raise_for_status).
-    """
-    try:
-        if importlib.util.find_spec("curl_cffi") is not None:
-            from curl_cffi import requests as curl_requests  # type: ignore
-            try:
-                session = curl_requests.Session(impersonate="chrome124")
-            except TypeError:
-                session = curl_requests.Session()
-            try:
-                session.headers.update({
-                    "Accept-Encoding": "identity",
-                    "Connection":      "keep-alive",
-                })
-            except Exception:
-                pass
-            try:
-                _EARLY_LOG.info("HTTP backend: curl_cffi (chrome124 impersonation)")
-            except Exception:
-                pass
-            return session
-    except Exception as e:
-        try:
-            _EARLY_LOG.warning(f"curl_cffi unavailable, falling back to requests ({e})")
-        except Exception:
-            pass
+def make_session(log_backend: bool = True) -> requests.Session:
     session = requests.Session()
-    retry = Retry(
-        total=MAX_RETRIES,
-        backoff_factor=0.75,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "HEAD"],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=MAX_WORKERS,
-        pool_maxsize=MAX_WORKERS * 2,
-        pool_block=False,
-    )
-    session.mount("http://",  adapter)
-    session.mount("https://", adapter)
+    session.trust_env = True
     session.headers.update({
-        "User-Agent":      "Reliable Asynchronous Parallel Internet Downloader",
+        "User-Agent": "RAPID/2.0 (parallel downloader)",
         "Accept-Encoding": "identity",
-        "Connection":      "keep-alive",
+        "Connection": "keep-alive",
     })
+
+    ca_bundle = (os.environ.get("REQUESTS_CA_BUNDLE")
+                 or os.environ.get("CURL_CA_BUNDLE")
+                 or os.environ.get("SSL_CERT_FILE"))
+    if ca_bundle:
+        session.verify = ca_bundle
+
+    
+    adapter = HTTPAdapter(
+        pool_connections=2,
+        pool_maxsize=2,
+        max_retries=Retry(total=0, connect=0, read=0, redirect=0, status=0),
+        pool_block=True,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    if log_backend:
+        _EARLY_LOG.info(
+            "HTTP backend: requests/urllib3; TLS certificate verification enabled"
+            + (f"; custom CA={ca_bundle}" if ca_bundle else "")
+        )
     return session
 
 
-def inspect_url(session, url: str, log: logging.Logger) -> ServerInfo:
-    resp = session.head(url, timeout=(CONNECT_TIMEOUT, 15), allow_redirects=True)
-    resp.raise_for_status()
-
-    total   = int(resp.headers.get("Content-Length", 0))
-    accepts = resp.headers.get("Accept-Ranges", "none").lower() != "none"
-    ctype   = resp.headers.get("Content-Type", "application/octet-stream")
-
+def _response_filename(resp, fallback_url: str) -> str:
+    cd = str(getattr(resp, "headers", {}).get("Content-Disposition", "") or "")
     name = ""
-    cd = resp.headers.get("Content-Disposition", "")
     if cd:
-        if "filename*=" in cd:
-            try:
-                rfc_part = cd.split("filename*=")[-1].split(";")[0].strip()
-                if "''" in rfc_part:
-                    charset, _, encoded = rfc_part.partition("''")
-                    name = unquote(encoded, encoding=charset or "utf-8")
-            except Exception:
-                name = ""
-        if not name and "filename=" in cd:
-            try:
-                raw = cd.split("filename=")[-1].split(";")[0].strip().strip('"\'')
-                if not raw.startswith("UTF-"):
-                    name = unquote(raw)
-            except Exception:
-                name = ""
+        star = re.search(r"filename\*\s*=\s*([^;]+)", cd, re.I)
+        if star:
+            raw = star.group(1).strip().strip('"')
+            if "''" in raw:
+                charset, _, encoded = raw.partition("''")
+                try:
+                    name = unquote(encoded, encoding=charset or "utf-8", errors="replace")
+                except Exception:
+                    name = unquote(encoded)
+        if not name:
+            plain = re.search(r'filename\s*=\s*(?:"([^"]+)"|([^;]+))', cd, re.I)
+            if plain:
+                name = (plain.group(1) or plain.group(2) or "").strip()
     if not name:
-        try:
-            final_u = getattr(resp, "url", url)
-        except Exception:
-            final_u = url
-        name = unquote(Path(urlparse(final_u).path).name) or "download"
+        final_url = str(getattr(resp, "url", "") or fallback_url)
+        name = unquote(Path(urlparse(final_url).path).name)
+    return _safe_filename(name or "download")
 
-    log.info(f"HEAD {url} -> {total/1e6:.2f} MB | Range={accepts} | type={ctype}")
 
-    try:
-        probe = session.get(
-            url, headers={"Range": f"bytes=0-{PROBE_RANGE_SIZE}"},
-            stream=False, timeout=(CONNECT_TIMEOUT, 15), allow_redirects=True,
+def _friendly_network_error(error: BaseException, url: str) -> str:
+    detail = _redact_error(error, url)
+    if isinstance(error, requests.exceptions.SSLError):
+        return (
+            "Falha na validação do certificado SSL. O RAPID mantém a verificação ativa; "
+            "confira a inspeção HTTPS do antivírus/proxy, instale a CA raiz confiável no sistema "
+            "ou configure REQUESTS_CA_BUNDLE/SSL_CERT_FILE. Detalhe: " + detail
         )
+    if _is_dns_error(error):
+        return (
+            f"Falha de DNS ao resolver o servidor {_safe_url_for_log(url)}. "
+            "Verifique DNS, VPN, proxy ou roteador. Detalhe: " + detail
+        )
+    if isinstance(error, requests.exceptions.Timeout):
+        return "Tempo de conexão esgotado; verifique a estabilidade da rede. Detalhe: " + detail
+    return detail
+
+
+def _request_with_retries(session, method: str, url: str, log: logging.Logger, **kwargs):
+    request_fn = getattr(session, method.lower())
+    transient_statuses = {429, 500, 502, 503, 504}
+    for attempt in range(1, MAX_RETRIES + 1):
+        response = None
         try:
-            peek = bytes(getattr(probe, "content", b"") or b"")[:4096]
-        except Exception:
-            peek = b""
+            response = request_fn(url, **kwargs)
+            if response.status_code in transient_statuses:
+                status = response.status_code
+                if attempt >= MAX_RETRIES:
+                    response.raise_for_status()
+                log.warning(
+                    f"{method.upper()} recebeu HTTP {status} ({attempt}/{MAX_RETRIES}); "
+                    "tentando novamente."
+                )
+                response.close()
+                _backoff(attempt)
+                continue
+            return response
+        except requests.exceptions.SSLError:
+            if response is not None:
+                response.close()
+            raise
+        except requests.exceptions.RequestException as e:
+            if response is not None:
+                response.close()
+            log.warning(
+                f"{method.upper()} falhou ({attempt}/{MAX_RETRIES}): "
+                f"{_friendly_network_error(e, url)}"
+            )
+            if attempt >= MAX_RETRIES:
+                raise
+            _backoff(attempt)
+    raise RuntimeError("request retry loop ended unexpectedly")
+
+
+def inspect_url(session, url: str, log: logging.Logger) -> ServerInfo:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("URL inválida: informe um endereço HTTP ou HTTPS completo.")
+
+    head = None
+    total = 0
+    ctype = "application/octet-stream"
+    name = _safe_filename(Path(unquote(parsed.path)).name or "download")
+    try:
+        head = _request_with_retries(
+            session, "head", url, log,
+            timeout=(CONNECT_TIMEOUT, 20), allow_redirects=True,
+        )
+        if head.status_code not in (405, 501):
+            head.raise_for_status()
+            total = int(head.headers.get("Content-Length", 0) or 0)
+            ctype = str(head.headers.get("Content-Type", ctype))
+            name = _response_filename(head, url)
+    finally:
+        if head is not None:
+            head.close()
+
+    probe = None
+    accepts_range = False
+    peek = b""
+    try:
+        probe = _request_with_retries(
+            session, "get", url, log,
+            headers={"Range": f"bytes=0-{PROBE_RANGE_SIZE}"},
+            stream=True,
+            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+            allow_redirects=True,
+        )
+        if probe.status_code == 206:
+            parsed_range = _parse_content_range(probe.headers.get("Content-Range", ""))
+            expected_probe_end = min(PROBE_RANGE_SIZE, parsed_range[2] - 1) if parsed_range else -1
+            if (parsed_range is not None and parsed_range[0] == 0
+                    and parsed_range[1] == expected_probe_end):
+                accepts_range = True
+                range_total = parsed_range[2]
+                if total and total != range_total:
+                    raise RuntimeError(
+                        f"Metadata inconsistente: HEAD informou {total} bytes, "
+                        f"mas Content-Range informou {range_total} bytes."
+                    )
+                total = range_total
+            else:
+                log.warning("Range probe returned 206 without a valid Content-Range; parallel mode disabled.")
+        elif probe.status_code == 200:
+            accepts_range = False
+            if not total:
+                total = int(probe.headers.get("Content-Length", 0) or 0)
+        else:
+            peek = next(probe.iter_content(chunk_size=4096), b"") or b""
+            blocked, reason = is_block_response(probe, peek)
+            if blocked:
+                raise ServerBlockedError(f"CDN/WAF bloqueou a requisição ({reason}).")
+            probe.raise_for_status()
+            raise RuntimeError(f"Unexpected HTTP status on range probe: {probe.status_code}")
+
+        ctype = str(probe.headers.get("Content-Type", ctype))
+        if probe.headers.get("Content-Disposition"):
+            name = _response_filename(probe, url)
+        iterator = probe.iter_content(chunk_size=4096)
+        peek = next(iterator, b"") or b""
         blocked, reason = is_block_response(probe, peek)
         if blocked:
-            log.warning(f"inspect probe: block/challenge detected ({reason}) — not starting blind download")
-            raise RuntimeError(
-                "Server returned a block/challenge page instead of the file "
-                f"(possible WAF/CDN protection: {reason}). "
-                "Try a warmed session/referer page or retry later."
-            )
-        probe_ctype = ""
-        try:
-            probe_ctype = str(probe.headers.get("Content-Type", ctype))
-        except Exception:
-            probe_ctype = ctype
-        final_name = name
-        try:
-            final_u2 = str(getattr(probe, "url", "") or "")
-            if final_u2:
-                cand = unquote(Path(urlparse(final_u2).path).name)
-                if cand:
-                    final_name = cand
-        except Exception:
-            pass
-        if peek and looks_like_html(peek) and _expected_binary(probe_ctype, final_name):
-            log.warning("inspect probe: first bytes look like HTML, not the file — aborting before big download")
-            raise RuntimeError(
-                "Server returned HTML instead of the file "
-                "(possible block, captcha or expired link). "
-                "Not starting the download."
-            )
-        if peek:
-            mismatch = magic_mismatch(peek, final_name, probe_ctype)
-            if mismatch:
-                log.warning(f"inspect probe: magic-byte mismatch — {mismatch}")
-                raise RuntimeError(
-                    f"Server response does not match the expected file type ({mismatch}). "
-                    "Not starting the download."
-                )
-    except RuntimeError:
-        raise
-    except Exception as e:
-        log.debug(f"inspect probe skipped/failed ({e}), trusting HEAD")
+            raise RuntimeError(f"Servidor retornou uma página de bloqueio/desafio ({reason}); download não iniciado.")
+    finally:
+        if probe is not None:
+            probe.close()
 
-    return ServerInfo(total_bytes=total, accepts_range=accepts,
-                       suggested_name=name, content_type=ctype)
+    if total <= 0:
+        raise RuntimeError("O servidor não informou o tamanho do arquivo (Content-Length/Content-Range).")
+
+    log.info(
+        f"HEAD/probe {_safe_url_for_log(url)} -> {total/1e9:.2f} GB | "
+        f"Range verificado={accepts_range} | type={ctype}"
+    )
+    return ServerInfo(total_bytes=total, accepts_range=accepts_range,
+                      suggested_name=name, content_type=ctype)
 
 
-def _backoff(attempt: int, blocked: bool = False) -> None:
+def _backoff(attempt: int, blocked: bool = False,
+             stop_event: Optional[threading.Event] = None) -> None:
     base = min(2 ** (max(1, attempt) - 1), 30)
     if blocked:
         base = min(base * 1.5, 30)
-    try:
-        delay = base * (0.7 + random.random() * 0.6)
-    except Exception:
-        delay = float(base)
-    time.sleep(delay)
+    delay = base * (0.7 + random.random() * 0.6)
+    deadline = time.monotonic() + delay
+    while time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return
+        time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+
+
+def _is_dns_error(error: BaseException) -> bool:
+    text = str(error).lower()
+    return (isinstance(error, socket.gaierror)
+            or "could not resolve host" in text
+            or "name or service not known" in text
+            or "getaddrinfo failed" in text
+            or "temporary failure in name resolution" in text)
+
+
+def _hash_file_region(file_name: str, start: int, length: int) -> str:
+    digest = hashlib.sha256()
+    remaining = int(length)
+    with open(file_name, "rb") as source:
+        source.seek(start)
+        while remaining:
+            block = source.read(min(4 * 1024 * 1024, remaining))
+            if not block:
+                raise OSError(f"arquivo parcial/truncado ao validar bytes em {start}")
+            digest.update(block)
+            remaining -= len(block)
+    return digest.hexdigest()
 
 
 def worker(
     worker_id: int,
-    session:   requests.Session,
-    state:     DownloadState,
-    chunk_q:   "queue.Queue[Chunk]",
+    session: requests.Session,
+    state: DownloadState,
+    chunk_q: "queue.Queue[Chunk]",
     file_lock: threading.Lock,
-    log:       logging.Logger,
+    log: logging.Logger,
     stop_event: threading.Event,
-    log_q:     "queue.Queue[str]",
-    tr:        Translator,
+    log_q: "queue.Queue[str]",
+    tr: Translator,
     state_lock: Optional[threading.Lock] = None,
+    abort_event: Optional[threading.Event] = None,
+    range_mode: bool = True,
 ) -> None:
-    while not stop_event.is_set():
+    abort_event = abort_event or threading.Event()
+
+    def persist_progress(chunk: Chunk, amount: int, digest: "hashlib._Hash") -> None:
+        with state._lock:
+            chunk.bytes_done += amount
+            chunk.sha256 = digest.hexdigest()
+            state._bytes_done += amount
+        save_state(state)
+
+    while not stop_event.is_set() and not abort_event.is_set():
         try:
             chunk = chunk_q.get_nowait()
         except queue.Empty:
             return
 
-        success = False
-        last_blocked = False
-        last_html = False
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            if stop_event.is_set():
-                chunk_q.task_done()
-                return
-
-            start = chunk.start + chunk.bytes_done
-            if start > chunk.end:
-                chunk.done = True
-                success = True
-                break
-
-            if attempt > 1 and (last_blocked or last_html):
+        try:
+            attempts = 0
+            chunk_complete = bool(chunk.done and chunk.bytes_done == chunk.size)
+            digest = hashlib.sha256()
+            if chunk.bytes_done and not chunk.done:
+                
                 try:
-                    probe_end = min(start + PROBE_SMALL_SIZE, chunk.end)
-                    probe_resp = session.get(
+                    remaining_prefix = chunk.bytes_done
+                    with open(state.file_name, "rb") as existing:
+                        existing.seek(chunk.start)
+                        while remaining_prefix:
+                            block = existing.read(min(CHUNK_SIZE, remaining_prefix))
+                            if not block:
+                                raise OSError("prefixo de retomada truncado")
+                            digest.update(block)
+                            remaining_prefix -= len(block)
+                    if chunk.sha256 and digest.hexdigest() != chunk.sha256:
+                        raise OSError("SHA-256 do prefixo salvo não confere")
+                except OSError as e:
+                    log.warning(f"[W{worker_id:02d}] prefixo da parte {chunk.index} inválido; reiniciando a parte: {e}")
+                    with state._lock:
+                        state._bytes_done = max(0, state._bytes_done - chunk.bytes_done)
+                        chunk.bytes_done = 0
+                        chunk.done = False
+                        chunk.sha256 = ""
+                    digest = hashlib.sha256()
+            while not chunk_complete and attempts < MAX_RETRIES:
+                if stop_event.is_set() or abort_event.is_set():
+                    break
+
+                
+                if not range_mode and chunk.bytes_done:
+                    with state._lock:
+                        state._bytes_done = max(0, state._bytes_done - chunk.bytes_done)
+                        chunk.bytes_done = 0
+                        chunk.done = False
+                        chunk.sha256 = ""
+                    digest = hashlib.sha256()
+                    with open(state.file_name, "wb"):
+                        pass
+
+                start = chunk.start + chunk.bytes_done
+                if start > chunk.end:
+                    with state._lock:
+                        chunk.done = True
+                    chunk_complete = True
+                    save_state(state)
+                    break
+
+                attempts += 1
+                headers = {}
+                if range_mode:
+                    headers["Range"] = f"bytes={start}-{chunk.end}"
+
+                response = None
+                stream_error = None
+                bytes_in_response = 0
+                expected_bytes = state.total_bytes if not range_mode else (chunk.end - start + 1)
+                write_pos = start
+                buffer = bytearray()
+
+                try:
+                    response = session.get(
                         state.url,
-                        headers={
-                            "Range": f"bytes={start}-{probe_end}",
-                            "User-Agent": pick_ua(attempt, True),
-                        },
-                        stream=False,
-                        timeout=(CONNECT_TIMEOUT, 15),
+                        headers=headers,
+                        stream=True,
+                        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
                         allow_redirects=True,
                     )
-                    try:
-                        probe_peek = bytes(getattr(probe_resp, "content", b"") or b"")[:4096]
-                    except Exception:
-                        probe_peek = b""
-                    p_blocked, p_reason = is_block_response(probe_resp, probe_peek)
-                    try:
-                        probe_resp.close()
-                    except Exception:
-                        pass
-                    if p_blocked:
-                        log.warning(tr.t(
-                            "chunk_blocked_detected",
-                            worker_id=f"{worker_id:02d}", chunk=chunk.index,
-                            status=getattr(probe_resp, "status_code", "?"), attempt=attempt,
-                        ))
-                        last_blocked = True
-                        last_html = False
-                        if attempt < MAX_RETRIES:
-                            _backoff(attempt, blocked=True)
-                        continue
-                    try:
-                        pct = str(probe_resp.headers.get("Content-Type", ""))
-                    except Exception:
-                        pct = ""
-                    if probe_peek and looks_like_html(probe_peek) and _expected_binary(pct, state.file_name):
-                        log.warning(tr.t(
-                            "chunk_html_detected",
-                            worker_id=f"{worker_id:02d}", chunk=chunk.index, attempt=attempt,
-                        ))
-                        last_blocked = False
-                        last_html = True
-                        if attempt < MAX_RETRIES:
-                            _backoff(attempt, blocked=True)
-                        continue
-                    if probe_peek and chunk.start == 0:
-                        mismatch0 = magic_mismatch(probe_peek, state.file_name, pct)
-                        if mismatch0:
-                            log.warning(f"[W{worker_id:02d}] chunk {chunk.index} magic-byte mismatch — {mismatch0}")
-                            last_blocked = False
-                            last_html = True
-                            if attempt < MAX_RETRIES:
-                                _backoff(attempt, blocked=True)
-                            continue
-                except Exception as e:
-                    log.debug(f"[W{worker_id:02d}] chunk {chunk.index} small-probe failed ({e}), retrying full range")
-                last_blocked = False
-                last_html = False
 
-            headers = {"Range": f"bytes={start}-{chunk.end}"}
-            if last_blocked or (attempt > 1 and last_html):
-                headers["User-Agent"] = pick_ua(attempt, True)
-            try:
-                resp = session.get(
-                    state.url,
-                    headers=headers,
-                    stream=True,
-                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-                )
-                resp.raise_for_status()
+                    if range_mode:
+                        if response.status_code == 200:
+                            raise RangeProtocolError(
+                                "Servidor ignorou Range (HTTP 200); alternando para download sequencial seguro."
+                            )
+                        if response.status_code != 206:
+                            if response.status_code >= 400:
+                                error_peek = next(response.iter_content(chunk_size=4096), b"") or b""
+                                blocked, reason = is_block_response(response, error_peek)
+                                if blocked:
+                                    raise ServerBlockedError(
+                                        f"CDN/WAF bloqueou o pedaço {chunk.index} ({reason})."
+                                    )
+                            response.raise_for_status()
+                            raise RuntimeError(f"HTTP inesperado para Range: {response.status_code}")
+                        content_range = _parse_content_range(response.headers.get("Content-Range", ""))
+                        if (content_range is None
+                                or content_range[0] != start
+                                or content_range[1] != chunk.end
+                                or content_range[2] != state.total_bytes):
+                            raise RangeProtocolError(
+                                f"Content-Range inválido para o pedaço {chunk.index}: "
+                                f"{response.headers.get('Content-Range', '<ausente>')}"
+                            )
+                    else:
+                        if response.status_code != 200:
+                            if response.status_code >= 400:
+                                error_peek = next(response.iter_content(chunk_size=4096), b"") or b""
+                                blocked, reason = is_block_response(response, error_peek)
+                                if blocked:
+                                    raise ServerBlockedError(
+                                        f"CDN/WAF bloqueou o download ({reason})."
+                                    )
+                            response.raise_for_status()
+                            raise RuntimeError(f"HTTP inesperado no download sequencial: {response.status_code}")
 
-                if start > chunk.start and resp.status_code != 206:
-                    log.warning(
-                        f"[W{worker_id:02d}] chunk {chunk.index}: server did not honor Range "
-                        f"(status {resp.status_code}), restarting chunk from the beginning"
-                    )
-                    start = chunk.start
-                    chunk.bytes_done = 0
-
-                try:
-                    resp_ctype = str(resp.headers.get("Content-Type", ""))
-                except Exception:
-                    resp_ctype = ""
-                write_pos = start
-                buf = bytearray()
-                interrupted = False
-                poisoned = False
-                first = True
-
-                for data in resp.iter_content(chunk_size=CHUNK_SIZE):
-                    if stop_event.is_set():
-                        interrupted = True
-                        break
-                    if not data:
-                        continue
-                    if first:
-                        first = False
+                    content_length = response.headers.get("Content-Length")
+                    if content_length:
                         try:
-                            peek0 = bytes(data[:4096])
-                        except Exception:
-                            peek0 = b""
-                        blocked0, reason0 = is_block_response(resp, peek0)
-                        if blocked0:
-                            log.warning(tr.t(
-                                "chunk_blocked_detected",
-                                worker_id=f"{worker_id:02d}", chunk=chunk.index,
-                                status=getattr(resp, "status_code", "?"), attempt=attempt,
-                            ))
-                            last_blocked = True
-                            last_html = False
-                            poisoned = True
-                            break
-                        if peek0 and looks_like_html(peek0) and _expected_binary(resp_ctype, state.file_name):
-                            log.warning(tr.t(
-                                "chunk_html_detected",
-                                worker_id=f"{worker_id:02d}", chunk=chunk.index, attempt=attempt,
-                            ))
-                            last_blocked = False
-                            last_html = True
-                            poisoned = True
-                            break
-                        if peek0 and chunk.start == 0:
-                            mismatch1 = magic_mismatch(peek0, state.file_name, resp_ctype)
-                            if mismatch1:
-                                log.warning(f"[W{worker_id:02d}] chunk {chunk.index} magic-byte mismatch — {mismatch1}")
-                                last_blocked = False
-                                last_html = True
-                                poisoned = True
-                                break
-                    buf.extend(data)
-                    n = len(data)
-                    state.record_bytes(n)
+                            if int(content_length) != expected_bytes:
+                                raise RangeProtocolError(
+                                    f"Content-Length inconsistente: esperado {expected_bytes}, recebido {content_length}."
+                                )
+                        except ValueError:
+                            pass
 
-                    if len(buf) >= WRITE_BUF_SIZE:
-                        with file_lock:
-                            with open(state.file_name, "r+b") as f:
-                                f.seek(write_pos)
-                                f.write(bytes(buf))
-                        write_pos += len(buf)
-                        buf.clear()
-                        chunk.bytes_done = write_pos - chunk.start
-                        if state_lock is not None:
-                            with state_lock:
-                                save_state(state)
+                    blocked, reason = is_block_response(response)
+                    if blocked:
+                        raise RuntimeError(f"CDN/WAF retornou desafio: {reason}")
 
-                try:
-                    resp.close()
-                except Exception:
-                    pass
+                    with open(state.file_name, "r+b", buffering=0) as output:
+                        output.seek(write_pos)
 
-                if poisoned:
-                    if attempt < MAX_RETRIES:
-                        _backoff(attempt, blocked=True)
-                    continue
+                        def flush_buffer() -> None:
+                            nonlocal write_pos
+                            if not buffer:
+                                return
+                            payload = bytes(buffer)
+                            with file_lock:
+                                output.seek(write_pos)
+                                written = output.write(payload)
+                            if written != len(payload):
+                                raise OSError(f"gravação incompleta no disco: {written}/{len(payload)} bytes")
+                            write_pos += written
+                            buffer.clear()
+                            persist_progress(chunk, written, digest)
 
-                if buf:
-                    with file_lock:
-                        with open(state.file_name, "r+b") as f:
-                            f.seek(write_pos)
-                            f.write(bytes(buf))
-                    write_pos += len(buf)
-                    buf.clear()
-                    chunk.bytes_done = write_pos - chunk.start
-                    if state_lock is not None:
-                        with state_lock:
-                            save_state(state)
+                        try:
+                            for data in response.iter_content(chunk_size=CHUNK_SIZE):
+                                if stop_event.is_set() or abort_event.is_set():
+                                    break
+                                if not data:
+                                    continue
+                                remaining = expected_bytes - bytes_in_response
+                                if len(data) > remaining:
+                                    raise RangeProtocolError(
+                                        f"Servidor enviou bytes além do intervalo solicitado no pedaço {chunk.index}."
+                                    )
+                                bytes_in_response += len(data)
+                                digest.update(data)
+                                buffer.extend(data)
+                                if len(buffer) >= WRITE_BUF_SIZE:
+                                    flush_buffer()
+                        except Exception as e:
+                            stream_error = e
+                        finally:
+                            
+                            
+                            flush_buffer()
 
-                if interrupted:
-                    chunk_q.task_done()
-                    return
-
-                chunk.done = True
-                chunk.bytes_done = chunk.size
-                success = True
-                last_blocked = False
-                last_html = False
-                log.info(tr.t("chunk_ok", worker_id=f"{worker_id:02d}", chunk=chunk.index, size=f"{chunk.size/1e6:.1f}"))
-                if state_lock is not None:
-                    with state_lock:
+                    if stop_event.is_set() or abort_event.is_set():
                         save_state(state)
-                break
+                        break
+                    if stream_error is not None:
+                        raise stream_error
+                    if bytes_in_response != expected_bytes:
+                        raise IncompleteDownloadError(
+                            f"Conexão terminou antes do esperado: {bytes_in_response}/{expected_bytes} bytes."
+                        )
 
-            except requests.exceptions.Timeout:
-                log.warning(tr.t("chunk_timeout", worker_id=f"{worker_id:02d}", chunk=chunk.index, attempt=attempt))
-                last_blocked = False
-            except requests.exceptions.ChunkedEncodingError:
-                log.warning(tr.t("chunk_stream_interrupted", worker_id=f"{worker_id:02d}", chunk=chunk.index, attempt=attempt))
-                last_blocked = False
-            except requests.exceptions.ConnectionError as e:
-                log.warning(tr.t("chunk_connection_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, error=e, attempt=attempt))
-                last_blocked = False
-            except requests.exceptions.HTTPError as e:
-                eresp = getattr(e, "response", None)
-                status = eresp.status_code if eresp is not None and hasattr(eresp, "status_code") else "?"
-                peek_h = b""
-                try:
-                    if eresp is not None:
-                        peek_h = bytes(getattr(eresp, "content", b"") or b"")[:4096]
-                except Exception:
-                    peek_h = b""
-                blocked_h, _r = is_block_response(eresp, peek_h) if eresp is not None else (False, "")
-                if blocked_h or (isinstance(status, int) and status in (403, 429) and peek_h and _body_indicates_block(peek_h)):
-                    log.warning(tr.t("chunk_blocked_detected", worker_id=f"{worker_id:02d}", chunk=chunk.index, status=status, attempt=attempt))
-                    last_blocked = True
-                else:
-                    log.warning(tr.t("chunk_http_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, status=status, attempt=attempt))
-                    last_blocked = False
-            except OSError as e:
-                log.error(tr.t("chunk_disk_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, error=e))
-                chunk_q.task_done()
-                return
-            except Exception as e:
-                status_x = getattr(getattr(e, "response", None), "status_code", "?")
-                log.warning(tr.t("chunk_connection_error", worker_id=f"{worker_id:02d}", chunk=chunk.index, error=e, attempt=attempt))
-                last_blocked = ("block" in str(e).lower() or "challenge" in str(e).lower()
-                                or "captcha" in str(e).lower())
+                    if chunk.bytes_done == chunk.size:
+                        with state._lock:
+                            chunk.sha256 = digest.hexdigest()
+                            chunk.done = True
+                        chunk_complete = True
+                        save_state(state)
 
-            if attempt < MAX_RETRIES:
-                _backoff(attempt, blocked=last_blocked)
+                except RangeProtocolError as e:
+                    with state._lock:
+                        state.range_error = str(e)
+                    abort_event.set()
+                    log.warning(f"[W{worker_id:02d}] {e}")
+                    break
+                except ServerBlockedError as e:
+                    with state._lock:
+                        state.fatal_error = f"CDN/WAF: {e}"
+                    abort_event.set()
+                    log.error(f"[W{worker_id:02d}] {e}")
+                    break
+                except requests.exceptions.SSLError as e:
+                    message = _redact_error(e, state.url)
+                    hint = (
+                        "Verificação SSL falhou. O RAPID não desativa a validação do certificado. "
+                        "Instale/atualize o certificado raiz do antivírus/proxy no sistema ou configure "
+                        "REQUESTS_CA_BUNDLE/SSL_CERT_FILE com o certificado CA correto."
+                    )
+                    with state._lock:
+                        state.fatal_error = f"SSL: {message}"
+                    log.error(f"[W{worker_id:02d}] SSL no pedaço {chunk.index}: {message}. {hint}")
+                    abort_event.set()
+                    break
+                except requests.exceptions.RequestException as e:
+                    message = _redact_error(e, state.url)
+                    if _is_dns_error(e):
+                        with state._lock:
+                            state.dns_errors += 1
+                            dns_failures = state.dns_errors
+                        log.warning(f"[W{worker_id:02d}] DNS no pedaço {chunk.index}, tentativa {attempts}/{MAX_RETRIES}: {message}")
+                        
+                        
+                        if dns_failures >= min(4, max(2, state.n_workers // 2)):
+                            with state._lock:
+                                state.fatal_error = "DNS: o host do servidor não está sendo resolvido pelo sistema."
+                            abort_event.set()
+                    elif isinstance(e, requests.exceptions.Timeout):
+                        log.warning(f"[W{worker_id:02d}] timeout no pedaço {chunk.index}, tentativa {attempts}/{MAX_RETRIES}: {message}")
+                    else:
+                        log.warning(f"[W{worker_id:02d}] conexão no pedaço {chunk.index}, tentativa {attempts}/{MAX_RETRIES}: {message}")
+                    if attempts < MAX_RETRIES:
+                        _backoff(attempts, stop_event=stop_event)
+                except OSError as e:
+                    with state._lock:
+                        state.fatal_error = f"Disco: {e}"
+                    log.error(f"[W{worker_id:02d}] falha real de gravação no disco, pedaço {chunk.index}: {e}")
+                    abort_event.set()
+                    break
+                except Exception as e:
+                    message = _redact_error(e, state.url)
+                    log.warning(f"[W{worker_id:02d}] erro no pedaço {chunk.index}, tentativa {attempts}/{MAX_RETRIES}: {message}")
+                    if attempts < MAX_RETRIES:
+                        _backoff(attempts, stop_event=stop_event)
+                finally:
+                    if response is not None:
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
 
-        if not success:
-            log.error(tr.t("chunk_failed", worker_id=f"{worker_id:02d}", chunk=chunk.index, retries=MAX_RETRIES))
+            if chunk_complete:
+                log.info(tr.t("chunk_ok", worker_id=f"{worker_id:02d}", chunk=chunk.index,
+                              size=f"{chunk.size/1e6:.1f}"))
+            elif not stop_event.is_set() and not abort_event.is_set():
+                log.error(tr.t("chunk_failed", worker_id=f"{worker_id:02d}",
+                               chunk=chunk.index, retries=MAX_RETRIES))
+        finally:
+            chunk_q.task_done()
 
-        chunk_q.task_done()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GUI
-# ─────────────────────────────────────────────────────────────────────────────
 
 def human_size(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -1354,7 +1376,6 @@ def human_size(n: float) -> str:
 
 
 class _Tooltip:
-    """Minimal hover tooltip for a widget."""
 
     def __init__(self, widget, text_var):
         self.widget = widget
@@ -1392,7 +1413,6 @@ class _Tooltip:
             self.tipwindow = None
 
     def update_text(self):
-        """Call after a language change so a currently-open tooltip refreshes."""
         self._hide()
 
 
@@ -1401,9 +1421,9 @@ class RapidGUI(tk.Tk):
         super().__init__()
 
         try:
-            self.log = setup_logging(clear=True)
+            self.log = setup_logging(clear=False)
         except NameError:
-            self.log = setup_logging(clear=True)
+            self.log = setup_logging(clear=False)
 
         self.log_q: "queue.Queue[str]" = queue.Queue()
         self._gui_log_handler = _GuiQueueHandler(self.log_q)
@@ -1433,8 +1453,7 @@ class RapidGUI(tk.Tk):
         self.info: Optional[ServerInfo] = None
         self.start_time = 0.0
         self.running = False
-
-
+        self._closing = False
 
         self._rgb_hue: float = 200.0
         self._rgb_job: Optional[str] = None
@@ -1454,7 +1473,7 @@ class RapidGUI(tk.Tk):
         self.after(90, self._drain_log_buffer)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ── UI ──
+    
 
     def _build_ui(self):
         pad = {"padx": 6, "pady": 4}
@@ -1484,7 +1503,7 @@ class RapidGUI(tk.Tk):
         )
         theme_combo.pack(side="left", padx=(6, 0))
         theme_combo.bind("<<ComboboxSelected>>", self._on_theme_change)
-        # ── theme live preview (arrow keys / mouse hover) ──
+        
         self.theme_combo = theme_combo
         self._committed_theme = self.th.current
         self._theme_listbox = None
@@ -1648,10 +1667,9 @@ class RapidGUI(tk.Tk):
         line(x_left, y_bot, x_left + barb_len, y_bot + barb_drop, thick)
         return img
 
-    # ── Preferences persistence ──
+    
 
     def _load_preferences(self) -> None:
-        """Load saved theme/language from config.cfg. Falls back to autodetect/default."""
         cfg = load_app_config(self.log)
 
         saved_theme = cfg.get("theme", "").strip().lower()
@@ -1673,7 +1691,7 @@ class RapidGUI(tk.Tk):
         else:
             self.tr.set_language(self.tr.autodetect())
 
-    # ── i18n ──
+    
 
     def _on_language_change(self, _event=None):
         name_to_code = {name: code for code, name in self._lang_codes}
@@ -1683,8 +1701,6 @@ class RapidGUI(tk.Tk):
         self._retranslate_static_ui()
 
     def _retranslate_static_ui(self):
-        """Updates all static widget texts after a language change (dynamic
-        log/status text keeps whatever language it was generated in)."""
         self.title(self.tr.t("window_title"))
         self.lbl_lang.configure(text=self.tr.t("language_label"))
         self.lbl_theme.configure(text=self.tr.t("theme_label"))
@@ -1705,7 +1721,7 @@ class RapidGUI(tk.Tk):
         if self.info is None:
             self.info_var.set(self.tr.t("info_default"))
 
-    # ── Theming ──
+    
 
     def _on_theme_change(self, _event=None):
         name_to_code = {name: code for code, name in self._theme_codes}
@@ -1715,10 +1731,9 @@ class RapidGUI(tk.Tk):
         self._committed_theme = code
         self._apply_theme()
 
-    # ── Theme live preview (arrow keys / mouse hover) ──
+    
 
     def _preview_theme(self, code: str) -> None:
-        """Apply theme immediately without persisting to config.cfg (preview)."""
         if code not in self.th.catalogs:
             return
         if code == self.th.current:
@@ -1727,36 +1742,29 @@ class RapidGUI(tk.Tk):
         self._apply_theme()
 
     def _get_theme_listbox(self):
-        """Return a wrapper for the internal Listbox widget of the theme Combobox popdown, or None.
-
-        The popdown Listbox is created at Tcl level by ttk::combobox, so
-        tkinter's nametowidget cannot find it. We wrap the existing Tcl
-        window path manually (tk.Listbox.__new__) so Python bindings work.
-        """
         try:
             pop = self.tk.call("ttk::combobox::PopdownWindow", str(self.theme_combo))
             lb_path = f"{pop}.f.l"
             if str(self.tk.call("winfo", "exists", lb_path)) != "1":
                 return None
-            lb = tk.Listbox.__new__(tk.Listbox)  # type: ignore
-            lb.master = self  # type: ignore
-            lb._w = lb_path  # type: ignore
-            lb.tk = self.tk  # type: ignore
+            lb = tk.Listbox.__new__(tk.Listbox)  
+            lb.master = self  
+            lb._w = lb_path  
+            lb.tk = self.tk  
             return lb
         except Exception:
             pass
         return None
 
     def _get_theme_popdown(self):
-        """Return a wrapper for the popdown Toplevel, or None."""
         try:
             pop = self.tk.call("ttk::combobox::PopdownWindow", str(self.theme_combo))
             if str(self.tk.call("winfo", "exists", pop)) != "1":
                 return None
-            w = tk.Toplevel.__new__(tk.Toplevel)  # type: ignore
-            w.master = self  # type: ignore
-            w._w = pop  # type: ignore
-            w.tk = self.tk  # type: ignore
+            w = tk.Toplevel.__new__(tk.Toplevel)  
+            w.master = self  
+            w._w = pop  
+            w.tk = self.tk  
             return w
         except Exception:
             return None
@@ -1767,7 +1775,7 @@ class RapidGUI(tk.Tk):
 
             self.after(40, self._hook_theme_listbox)
             return
-        lb_path = lb._w  # type: ignore
+        lb_path = lb._w  
 
         hooked = getattr(self, "_theme_lb_hooked_paths", set())
         first_time = lb_path not in hooked
@@ -1781,7 +1789,7 @@ class RapidGUI(tk.Tk):
                 except Exception:
                     pass
             hooked.add(lb_path)
-            self._theme_lb_hooked_paths = hooked  # type: ignore
+            self._theme_lb_hooked_paths = hooked  
             self._theme_listbox = lb
 
             try:
@@ -1850,29 +1858,27 @@ class RapidGUI(tk.Tk):
     def _on_theme_popdown_unmap(self, _event=None) -> None:
 
 
-
         pass
 
     def _start_theme_preview_poll(self) -> None:
-        """Poll active Listbox index while popdown is mapped to catch arrow/hover."""
         self._poll_theme_preview()
 
     def _poll_theme_preview(self) -> None:
         try:
             pop = self._get_theme_popdown()
-            if pop is None or not pop.winfo_ismapped():  # type: ignore
+            if pop is None or not pop.winfo_ismapped():  
                 return
             lb = self._get_theme_listbox()
             if lb is None:
                 return
 
             try:
-                if lb.size() == 0:  # type: ignore
+                if lb.size() == 0:  
                     self.after(80, self._poll_theme_preview)
                     return
 
-                idx = lb.index("active")  # type: ignore
-                name = lb.get(idx)  # type: ignore
+                idx = lb.index("active")  
+                name = lb.get(idx)  
                 name_to_code = {name: code for code, name in self._theme_codes}
                 code = name_to_code.get(name)
                 if code and code != self.th.current:
@@ -1880,13 +1886,12 @@ class RapidGUI(tk.Tk):
             except Exception:
                 pass
 
-            if pop.winfo_ismapped():  # type: ignore
+            if pop.winfo_ismapped():  
                 self.after(80, self._poll_theme_preview)
         except Exception:
             pass
 
     def _on_theme_focus_out(self, _event=None) -> None:
-
 
 
         def _check():
@@ -1898,7 +1903,7 @@ class RapidGUI(tk.Tk):
 
             try:
                 focused_path = str(focused) if focused is not None else ""
-                lb_path = lb._w if lb is not None else ""  # type: ignore
+                lb_path = lb._w if lb is not None else ""  
                 combo_path = str(self.theme_combo)
                 if focused_path in (combo_path, lb_path):
                     return
@@ -2011,17 +2016,15 @@ class RapidGUI(tk.Tk):
             bg=c["log_background_color"], fg=c["log_text_color"], insertbackground=c["log_text_color"],
         )
 
-    # ── RGB Cycle theme — slow and steady ──
+    
 
     @staticmethod
     def _hsv_to_hex(h: float, s: float, v: float) -> str:
-        """h in 0-360, s/v in 0-1 → #rrggbb."""
         h = (h % 360) / 360.0
         r, g, b = colorsys.hsv_to_rgb(h, max(0, min(1, s)), max(0, min(1, v)))
         return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
 
     def _update_rgb_catalog(self) -> None:
-        """Mutate the rgb catalog in-place based on current hue."""
         h = self._rgb_hue % 360
 
         cat = self.th.catalogs.get("rgb")
@@ -2041,7 +2044,6 @@ class RapidGUI(tk.Tk):
         cat["input_text_color"]       = "#e6e6ff"
 
     def _refresh_rgb_params(self) -> None:
-        """Reload interval/step from rgb.theme's cycle_interval_ms / cycle_step_deg if present."""
         cfg = self.th.cycle_params.get("rgb", {})
         try:
             interval = int(float(cfg.get("cycle_interval_ms", self._rgb_interval_ms)))
@@ -2083,7 +2085,7 @@ class RapidGUI(tk.Tk):
 
         self._rgb_job = self.after(self._rgb_interval_ms, self._rgb_tick)
 
-    # ── Actions ──
+    
 
     def _append_log(self, msg: str):
         c = self.th.colors()
@@ -2093,6 +2095,14 @@ class RapidGUI(tk.Tk):
         self.log_text.configure(state="normal")
         start_index = self.log_text.index("end-1c")
         self.log_text.insert("end", msg + "\n")
+        
+        
+        try:
+            line_count = int(self.log_text.index("end-1c").split(".")[0])
+            if line_count > 3000:
+                self.log_text.delete("1.0", f"{line_count - 2500}.0")
+        except Exception:
+            pass
         end_index = self.log_text.index("end-1c")
 
         tag = f"fade_{self._fade_counter}"
@@ -2124,17 +2134,14 @@ class RapidGUI(tk.Tk):
         return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(v)))) for v in rgb)
 
     def _queue_log(self, msg: str, level: int = logging.INFO) -> None:
-        """Log a message — it reaches the GUI automatically via the logger's GUI handler."""
         try:
             self.log.log(level, msg)
         except Exception:
             pass
 
-    # ── "Save as" auto-naming vs. user's own choice ──
+    
 
     def _set_filename_auto(self, value: str) -> None:
-        """Programmatic filename update (derived from the URL/server) — never
-        counts as the user having picked their own name."""
         self._suppress_filename_trace = True
         try:
             self.filename_var.set(value)
@@ -2166,27 +2173,43 @@ class RapidGUI(tk.Tk):
         if not url:
             messagebox.showwarning(self.tr.t("app_title"), self.tr.t("warn_need_url_verify"))
             return
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            messagebox.showwarning(self.tr.t("app_title"), "Informe uma URL HTTP ou HTTPS válida.")
+            return
+
+        self.btn_verify.configure(state="disabled")
 
         def task():
+            session = make_session()
             try:
-                info = inspect_url(make_session(), url, self.log)
+                info = inspect_url(session, url, self.log)
             except Exception as e:
-                self.log.error(self.tr.t("error_checking_url", error=e))
+                self.log.error(self.tr.t("error_checking_url", error=_friendly_network_error(e, url)))
+                self.after(0, lambda: self.btn_verify.configure(state="normal"))
                 return
-            self.info = info
-            if not self._filename_user_edited:
-                self._set_filename_auto(info.suggested_name)
-            self.info_var.set(self.tr.t(
-                "info_format",
-                size=human_size(info.total_bytes),
-                range=self.tr.t("range_yes") if info.accepts_range else self.tr.t("range_no"),
-                type=info.content_type,
-            ))
-            self.log.info(self.tr.t(
-                "verified_msg", url=url, size=human_size(info.total_bytes), range=info.accepts_range,
-            ))
+            finally:
+                session.close()
 
-        threading.Thread(target=task, daemon=True).start()
+            def update_ui():
+                self.info = info
+                if not self._filename_user_edited:
+                    self._set_filename_auto(info.suggested_name)
+                self.info_var.set(self.tr.t(
+                    "info_format",
+                    size=human_size(info.total_bytes),
+                    range=self.tr.t("range_yes") if info.accepts_range else self.tr.t("range_no"),
+                    type=info.content_type,
+                ))
+                self.log.info(self.tr.t(
+                    "verified_msg", url=_safe_url_for_log(url), size=human_size(info.total_bytes),
+                    range=self.tr.t("range_yes") if info.accepts_range else self.tr.t("range_no"),
+                ))
+                self.btn_verify.configure(state="normal")
+
+            self.after(0, update_ui)
+
+        threading.Thread(target=task, name="RAPID-inspect", daemon=True).start()
 
     def _on_start(self):
         if self.running:
@@ -2195,29 +2218,77 @@ class RapidGUI(tk.Tk):
         if not url:
             messagebox.showwarning(self.tr.t("app_title"), self.tr.t("warn_need_url"))
             return
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            messagebox.showwarning(self.tr.t("app_title"), "Informe uma URL HTTP ou HTTPS válida.")
+            return
 
         raw_filename = self.filename_var.get().strip()
         auto_name = not self._filename_user_edited
-        file_name = raw_filename or unquote(Path(urlparse(url).path).name) or "download"
-        self._set_filename_auto(file_name)
-        n_workers = max(1, min(self.workers_var.get(), MAX_WORKERS))
+        file_name = raw_filename or _safe_filename(Path(unquote(parsed.path)).name) or "download"
+        if auto_name:
+            file_name = _safe_filename(file_name)
+        file_name = str(Path(file_name).expanduser().resolve())
+        target_path = Path(file_name)
+        if target_path.exists() and target_path.is_dir():
+            messagebox.showwarning(
+                self.tr.t("app_title"),
+                "O destino informado é uma pasta. Escolha um nome de arquivo para salvar o download.",
+            )
+            return
+        if target_path.exists():
+            saved_meta = load_state(file_name)
+            saved_hash = saved_meta.get("url_sha256") if isinstance(saved_meta, dict) else None
+            saved_url_match = (
+                saved_hash == hashlib.sha256(url.encode("utf-8")).hexdigest()
+                if saved_hash else (isinstance(saved_meta, dict) and saved_meta.get("url") == url)
+            )
+            if not saved_url_match:
+                if auto_name:
+                    stem, suffix = target_path.stem, target_path.suffix
+                    index = 1
+                    while True:
+                        candidate = target_path.with_name(f"{stem} ({index}){suffix}")
+                        if not candidate.exists() and not _state_path(str(candidate)).exists():
+                            target_path = candidate
+                            file_name = str(candidate)
+                            self.log.info(f"Arquivo já existia; novo destino selecionado: {candidate.name}")
+                            break
+                        index += 1
+                elif not messagebox.askyesno(
+                    self.tr.t("app_title"),
+                    f"O arquivo já existe e não há retomada válida para esta URL:\n{file_name}\n\nDeseja sobrescrevê-lo?",
+                ):
+                    return
+        self._set_filename_auto(Path(file_name).name if auto_name else file_name)
+
         try:
-            n_parts = max(0, int(self.parts_var.get()))
-        except Exception:
+            n_workers = max(1, min(int(self.workers_var.get()), MAX_WORKERS))
+        except (ValueError, tk.TclError):
+            n_workers = DEFAULT_WORKERS
+            self.workers_var.set(n_workers)
+        try:
+            n_parts = max(0, min(int(self.parts_var.get()), 10000))
+        except (ValueError, tk.TclError):
             n_parts = 0
+            self.parts_var.set(0)
 
         self.stop_event = threading.Event()
         self.running = True
         self.btn_start.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
+        self.btn_verify.configure(state="disabled")
         self.progress.configure(value=0)
         self.status_var.set(self.tr.t("status_checking"))
         self.parts_actual_var.set("")
+        self.stats_var.set("")
 
         prevent_sleep(self.log)
-
         self.download_thread = threading.Thread(
-            target=self._run_download, args=(url, file_name, n_workers, n_parts, auto_name), daemon=True
+            target=self._run_download,
+            args=(url, file_name, n_workers, n_parts, auto_name),
+            name="RAPID-download",
+            daemon=True,
         )
         self.download_thread.start()
 
@@ -2227,24 +2298,39 @@ class RapidGUI(tk.Tk):
             self.log.info(self.tr.t("cancel_requested"))
 
     def _on_close(self):
-
-        try:
-            self._stop_rgb_cycle()
-        except Exception:
-            pass
         if self.running:
             if not messagebox.askyesno(self.tr.t("confirm_close_title"), self.tr.t("confirm_close_msg")):
                 return
+            self._closing = True
             self.stop_event.set()
+            self.btn_start.configure(state="disabled")
+            self.btn_cancel.configure(state="disabled")
+            self.btn_verify.configure(state="disabled")
+            self._stop_rgb_cycle()
+            self.after(100, self._close_when_worker_stops)
+            return
+        self._close_now()
+
+    def _close_when_worker_stops(self):
+        thread = self.download_thread
+        if thread is not None and thread.is_alive():
+            self.after(100, self._close_when_worker_stops)
+            return
+        self._close_now()
+
+    def _close_now(self):
         try:
+            self._stop_rgb_cycle()
             self.log.info("RAPID closed by user")
             for h in self.log.handlers:
                 try:
                     h.flush()
-                    if hasattr(h, "stream") and hasattr(h.stream, "fileno"):
-                        os.fsync(h.stream.fileno())
                 except Exception:
                     pass
+        except Exception:
+            pass
+        try:
+            allow_sleep(self.log)
         except Exception:
             pass
         self.destroy()
@@ -2263,7 +2349,7 @@ class RapidGUI(tk.Tk):
             pass
         try:
             if sys.platform.startswith("win"):
-                os.startfile(LOG_FILE)  # type: ignore[attr-defined]
+                os.startfile(LOG_FILE)  
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", str(LOG_FILE)])
             else:
@@ -2271,196 +2357,293 @@ class RapidGUI(tk.Tk):
         except Exception as e:
             messagebox.showinfo(self.tr.t("log_file_title"), f"{LOG_FILE}\n\n{e}")
 
-    # ── Download core ──
+    
 
-    def _run_download(self, url: str, file_name: str, n_workers: int, n_parts: int = 0, auto_name: bool = False):
-        session = make_session()
+    def _run_download(self, url: str, file_name: str, n_workers: int,
+                      n_parts: int = 0, auto_name: bool = False):
+        inspect_session = None
         self.start_time = time.monotonic()
-
         try:
-            info = inspect_url(session, url, self.log)
-        except Exception as e:
-            self.log.error(self.tr.t("error_checking_url", error=e))
-            self._finish(success=False)
-            return
+            inspect_session = make_session()
+            info = inspect_url(inspect_session, url, self.log)
+            self.info = info
+            self.log.info(self.tr.t(
+                "size_range_type_msg",
+                size=human_size(info.total_bytes),
+                range=self.tr.t("range_yes") if info.accepts_range else self.tr.t("range_no"),
+                type=info.content_type,
+            ))
 
-        self.info = info
-        self.log.info(self.tr.t(
-            "size_range_type_msg",
-            size=human_size(info.total_bytes),
-            range=self.tr.t("range_yes") if info.accepts_range else self.tr.t("range_no"),
-            type=info.content_type,
-        ))
+            if auto_name and info.suggested_name:
+                parent = Path(file_name).parent
+                suggested_path = parent / _safe_filename(info.suggested_name)
+                if suggested_path.exists() and suggested_path.resolve() != Path(file_name).resolve():
+                    existing_meta = load_state(str(suggested_path))
+                    existing_hash = (existing_meta.get("url_sha256")
+                                     if isinstance(existing_meta, dict) else None)
+                    expected_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()
+                    same_download = (
+                        existing_hash == expected_hash if existing_hash
+                        else (isinstance(existing_meta, dict) and existing_meta.get("url") == url)
+                    )
+                    if not same_download:
+                        stem, suffix = suggested_path.stem, suggested_path.suffix
+                        index = 1
+                        while suggested_path.exists() or _state_path(str(suggested_path)).exists():
+                            suggested_path = parent / f"{stem} ({index}){suffix}"
+                            index += 1
+                        self.log.info(
+                            f"Nome sugerido já existe; destino alternativo: {suggested_path.name}"
+                        )
+                file_name = str(suggested_path.resolve())
+                self.after(0, lambda fn=Path(file_name).name: self._set_filename_auto(fn))
 
-        if auto_name and info.suggested_name and info.suggested_name != file_name:
-            file_name = info.suggested_name
-            self.after(0, lambda fn=file_name: self._set_filename_auto(fn))
+            if info.total_bytes <= 0:
+                raise RuntimeError("O servidor não informou um tamanho válido para o arquivo.")
 
-        if not info.accepts_range or info.total_bytes < MIN_SPLIT_SIZE:
-            fresh_chunks = [Chunk(index=0, start=0, end=max(info.total_bytes - 1, 0))]
-            part_size_used = max(info.total_bytes, 1)
-        else:
-            if n_parts and n_parts > 0:
-                part_size_used = max(-(-info.total_bytes // n_parts), MIN_SPLIT_SIZE)  # ceil division
+            use_range = bool(info.accepts_range)
+            if use_range:
+                if n_parts > 0:
+                    part_size_used = max(-(-info.total_bytes // n_parts), MIN_SPLIT_SIZE)
+                else:
+                    part_size_used = CHUNK_PART_SIZE
+                fresh_chunks = []
+                offset = 0
+                while offset < info.total_bytes:
+                    end = min(offset + part_size_used - 1, info.total_bytes - 1)
+                    fresh_chunks.append(Chunk(index=len(fresh_chunks), start=offset, end=end))
+                    offset = end + 1
             else:
-                part_size_used = CHUNK_PART_SIZE
+                
+                
+                part_size_used = info.total_bytes
+                fresh_chunks = [Chunk(index=0, start=0, end=info.total_bytes - 1)]
+                n_workers = 1
 
-            fresh_chunks, offset, idx = [], 0, 0
-            while offset < info.total_bytes:
-                end = min(offset + part_size_used - 1, info.total_bytes - 1)
-                fresh_chunks.append(Chunk(index=idx, start=offset, end=end))
-                offset = end + 1
-                idx += 1
+            saved = load_state(file_name) if use_range else None
+            resumed = False
+            if use_range and _saved_state_matches(saved, fresh_chunks, url, info.total_bytes, file_name):
+                try:
+                    chunks = [
+                        Chunk(
+                            index=int(c["index"]), start=int(c["start"]), end=int(c["end"]),
+                            done=bool(c["done"]), bytes_done=int(c.get("bytes_done", 0)),
+                            sha256=str(c.get("sha256", "")),
+                        )
+                        for c in saved["chunks"]
+                    ]
+                    
+                    
+                    for resumed_chunk in chunks:
+                        if resumed_chunk.done:
+                            actual_digest = _hash_file_region(
+                                file_name, resumed_chunk.start, resumed_chunk.size
+                            )
+                            if actual_digest != resumed_chunk.sha256:
+                                self.log.warning(
+                                    f"Parte {resumed_chunk.index} falhou na verificação SHA-256; será baixada novamente."
+                                )
+                                resumed_chunk.done = False
+                                resumed_chunk.bytes_done = 0
+                                resumed_chunk.sha256 = ""
+                    resumed = True
+                except Exception as resume_error:
+                    self.log.warning(f"Estado de retomada inválido; reiniciando: {resume_error}")
+                    chunks = fresh_chunks
+            else:
+                chunks = fresh_chunks
 
-        saved = load_state(file_name)
-        resumed = bool(
-            saved
-            and saved.get("url") == url
-            and int(saved.get("total_bytes", -1)) == info.total_bytes
-            and Path(file_name).exists()
-            and Path(file_name).stat().st_size == info.total_bytes
-            and (len(saved.get("chunks", [])) <= 1 or info.accepts_range)
-        )
-
-        if resumed:
-            chunks = [
-                Chunk(
-                    index=c["index"], start=c["start"], end=c["end"],
-                    done=bool(c["done"]), bytes_done=int(c.get("bytes_done", 0)),
-                )
-                for c in saved["chunks"]
-            ]
-        else:
-            chunks = fresh_chunks
-            clear_state(file_name)
-
-        self.state = DownloadState(
-            url=url, file_name=file_name, total_bytes=info.total_bytes,
-            n_workers=n_workers, chunks=chunks,
-        )
-        self.after(0, lambda n=len(chunks): self.parts_actual_var.set(
-            self.tr.t("parts_actual_format", n=n)
-        ))
-
-        already_done = sum(c.bytes_done for c in chunks)
-        if already_done:
-            self.state._bytes_done = already_done
-
-        if resumed:
-            done_count = sum(1 for c in chunks if c.done)
-            self.log.info(
-                f"Resuming '{file_name}': {done_count}/{len(chunks)} chunks already complete "
-                f"({human_size(already_done)} of {human_size(info.total_bytes)})."
+            self.state = DownloadState(
+                url=url, file_name=file_name, total_bytes=info.total_bytes,
+                n_workers=n_workers, chunks=chunks,
             )
-        else:
-            try:
-                with open(file_name, "wb") as f:
-                    if info.total_bytes > 0:
-                        f.seek(info.total_bytes - 1)
-                        f.write(b"\x00")
-            except OSError as e:
-                self.log.error(self.tr.t("error_create_file", error=e))
+            with self.state._lock:
+                self.state._bytes_done = sum(c.bytes_done for c in chunks)
+
+            self.after(0, lambda n=len(chunks): self.parts_actual_var.set(
+                self.tr.t("parts_actual_format", n=n)
+            ))
+
+            if not resumed:
+                clear_state(file_name)
+                try:
+                    target_parent = Path(file_name).parent
+                    target_parent.mkdir(parents=True, exist_ok=True)
+                    free_bytes = shutil.disk_usage(target_parent).free
+                    if free_bytes < info.total_bytes:
+                        raise OSError(
+                            f"Espaço insuficiente: arquivo requer {human_size(info.total_bytes)}, "
+                            f"mas há {human_size(free_bytes)} livres."
+                        )
+                    if use_range:
+                        with open(file_name, "wb") as f:
+                            f.truncate(info.total_bytes)
+                    else:
+                        with open(file_name, "wb"):
+                            pass
+                except OSError as e:
+                    raise OSError(f"Não foi possível criar o arquivo de destino: {e}") from e
+                if use_range:
+                    save_state(self.state)
+            else:
+                save_state(self.state)
+                done_count = sum(1 for c in chunks if c.done)
+                self.log.info(
+                    f"Retomando '{Path(file_name).name}': {done_count}/{len(chunks)} partes completas "
+                    f"({human_size(self.state.bytes_downloaded)} de {human_size(info.total_bytes)})."
+                )
+
+            self.log.info(
+                f"Iniciando '{Path(file_name).name}': {len(chunks)} partes, "
+                f"{human_size(part_size_used)} por parte, {n_workers} worker(s), "
+                f"Range={'sim' if use_range else 'não'}"
+            )
+
+            def run_workers(target_chunks: list[Chunk], workers: int, ranged: bool,
+                            abort: threading.Event) -> None:
+                chunk_queue: "queue.Queue[Chunk]" = queue.Queue()
+                for item in target_chunks:
+                    if not item.done:
+                        chunk_queue.put(item)
+                if chunk_queue.empty():
+                    return
+                count = max(1, min(workers, chunk_queue.qsize()))
+                sessions = [make_session(log_backend=False) for _ in range(count)]
+                shared_file_lock = threading.Lock()
+                try:
+                    with ThreadPoolExecutor(max_workers=count, thread_name_prefix="RAPID-worker") as executor:
+                        futures = [
+                            executor.submit(
+                                worker, i, sessions[i], self.state, chunk_queue,
+                                shared_file_lock, self.log, self.stop_event,
+                                self.log_q, self.tr, None, abort, ranged,
+                            )
+                            for i in range(count)
+                        ]
+                        for future in as_completed(futures):
+                            try:
+                                future.result()
+                            except Exception as e:
+                                self.log.error(f"Worker terminou com erro inesperado: {_redact_error(e, url)}")
+                                abort.set()
+                finally:
+                    for worker_session in sessions:
+                        try:
+                            worker_session.close()
+                        except Exception:
+                            pass
+
+            abort_event = threading.Event()
+            run_workers(chunks, n_workers, use_range, abort_event)
+
+            if self.stop_event.is_set():
+                if use_range:
+                    save_state(self.state)
+                else:
+                    clear_state(file_name)
+                self.log.info(self.tr.t("cancelled_by_user"))
                 self._finish(success=False)
                 return
-            save_state(self.state)
 
-        self.log.info(self.tr.t(
-            "starting_download",
-            file=file_name, chunks=len(chunks), mb=part_size_used // 1024 // 1024, workers=n_workers,
-        ))
+            
+            
+            
+            if self.state.range_error and use_range and not self.state.fatal_error:
+                reason = self.state.range_error
+                self.log.warning(f"Servidor não respeitou HTTP Range ({reason}); reiniciando sequencialmente.")
+                clear_state(file_name)
+                with open(file_name, "wb"):
+                    pass
+                single = Chunk(index=0, start=0, end=info.total_bytes - 1)
+                self.state = DownloadState(
+                    url=url, file_name=file_name, total_bytes=info.total_bytes,
+                    n_workers=1, chunks=[single],
+                )
+                fallback_abort = threading.Event()
+                run_workers([single], 1, False, fallback_abort)
+                use_range = False
 
-        file_lock = threading.Lock()
-        state_lock = threading.Lock()
+            if self.stop_event.is_set():
+                if use_range:
+                    save_state(self.state)
+                else:
+                    clear_state(file_name)
+                self.log.info(self.tr.t("cancelled_by_user"))
+                self._finish(success=False)
+                return
 
-        round_no = 0
-        while round_no < MAX_ROUNDS:
-            round_no += 1
-            pending = [c for c in self.state.chunks if not c.done]
-            if not pending:
-                break
-            if round_no > 1:
-                self.log.warning(self.tr.t(
-                    "retry_round", round=round_no, count=len(pending),
-                ))
+            if self.state.fatal_error:
+                if use_range:
+                    save_state(self.state)
+                self.log.error(f"Download interrompido por erro não recuperável: {self.state.fatal_error}")
+                self._finish(success=False)
+                return
+
+            failed = [c.index for c in self.state.chunks if not c.done or c.bytes_done != c.size]
+            if failed:
+                if use_range:
+                    save_state(self.state)
+                else:
+                    clear_state(file_name)
+                self.log.error(f"Download incompleto: {len(failed)} parte(s) pendente(s): {failed[:10]}")
+                self._finish(success=False)
+                return
+
+            final_path = Path(file_name)
+            actual_size = final_path.stat().st_size
+            if actual_size != info.total_bytes:
+                raise IOError(
+                    f"Tamanho final inválido: esperado {info.total_bytes} bytes, encontrado {actual_size}."
+                )
+
+            with final_path.open("rb+") as final_file:
+                final_file.flush()
+                os.fsync(final_file.fileno())
+
+            clear_state(file_name)
+            elapsed = time.monotonic() - self.start_time
+            avg = info.total_bytes / elapsed / 1e6 if elapsed > 0 else 0
+            self.log.info(self.tr.t(
+                "download_complete",
+                file=Path(file_name).name, size=human_size(info.total_bytes),
+                elapsed=f"{elapsed:.1f}", speed=f"{avg:.2f}",
+            ))
+            self._finish(success=True)
+
+        except Exception as e:
+            
+            
+            self.log.error(f"Falha no download: {_friendly_network_error(e, url)}")
+            if self.state is not None and self.state.file_name == file_name:
+                if self.state.range_error is None and self.state.fatal_error is None:
+                    save_state(self.state)
+            self._finish(success=False)
+        finally:
+            if inspect_session is not None:
                 try:
-                    session.headers.update({"User-Agent": pick_ua(round_no, True)})
+                    inspect_session.close()
                 except Exception:
                     pass
-            chunk_q: "queue.Queue[Chunk]" = queue.Queue()
-            for c in pending:
-                chunk_q.put(c)
-            n_active = max(1, min(n_workers, len(pending)))
-            with ThreadPoolExecutor(max_workers=n_active) as executor:
-                futures = [
-                    executor.submit(
-                        worker, i, session, self.state, chunk_q, file_lock, self.log, self.stop_event,
-                        self.log_q, self.tr, state_lock,
-                    )
-                    for i in range(n_active)
-                ]
-                for f in as_completed(futures):
-                    try:
-                        f.result()
-                    except Exception as e:
-                        self.log.error(self.tr.t("worker_finished_error", error=e))
-            if self.stop_event.is_set():
-                break
-            remaining = [c for c in self.state.chunks if not c.done]
-            if not remaining:
-                break
-            if round_no >= MAX_ROUNDS:
-                break
-
-        if self.stop_event.is_set():
-            save_state(self.state)
-            self.log.info(self.tr.t("cancelled_by_user"))
-            self._finish(success=False)
-            return
-
-        failed = [c.index for c in self.state.chunks if not c.done]
-        if failed:
-            save_state(self.state)
-            self.log.warning(self.tr.t("chunks_incomplete", count=len(failed), list=failed[:10]))
-            self._finish(success=False)
-            return
-
-        try:
-            if _expected_binary(info.content_type, file_name):
-                with open(file_name, "rb") as f:
-                    head_final = f.read(SNIFF_SIZE)
-                suspicious_size = (
-                    info.total_bytes > 0
-                    and Path(file_name).stat().st_size < FLATLINE_MIN_BYTES
-                    and info.total_bytes > 1024 * 1024
-                )
-                mismatch_final = magic_mismatch(head_final, file_name, info.content_type) if head_final else None
-                if (head_final and looks_like_html(head_final)) or suspicious_size or mismatch_final:
-                    if mismatch_final:
-                        self.log.error(f"flatline check: {mismatch_final}")
-                    self.log.error(self.tr.t("flatline_suspect"))
-                    save_state(self.state)
-                    self._finish(success=False)
-                    return
-        except Exception as e:
-            self.log.debug(f"flatline check skipped ({e})")
-
-        clear_state(file_name)
-        elapsed = time.monotonic() - self.start_time
-        avg = info.total_bytes / elapsed / 1e6 if elapsed > 0 else 0
-        self.log.info(self.tr.t(
-            "download_complete",
-            file=file_name, size=human_size(info.total_bytes), elapsed=f"{elapsed:.1f}", speed=f"{avg:.2f}",
-        ))
-        self._finish(success=True)
 
     def _finish(self, success: bool):
-        allow_sleep(self.log)
-        self.running = False
-        self.btn_start.configure(state="normal")
-        self.btn_cancel.configure(state="disabled")
-        self.status_var.set(self.tr.t("status_done") if success else self.tr.t("status_interrupted"))
+        def update_ui():
+            try:
+                allow_sleep(self.log)
+                self.running = False
+                if self.winfo_exists():
+                    self.btn_start.configure(state="normal")
+                    self.btn_cancel.configure(state="disabled")
+                    self.btn_verify.configure(state="normal")
+                    self.status_var.set(self.tr.t("status_done") if success else self.tr.t("status_interrupted"))
+            except tk.TclError:
+                pass
+        try:
+            self.after(0, update_ui)
+        except tk.TclError:
+            allow_sleep(self.log)
+            self.running = False
 
-    # ── Pollers ──
+    
 
     def _poll_log(self):
         try:
@@ -2483,7 +2666,7 @@ class RapidGUI(tk.Tk):
             n_chunks = len(self.state.chunks)
             self.parts_actual_var.set(self.tr.t("parts_actual_format", n=n_chunks))
         if self.state is not None and self.info is not None and self.info.total_bytes > 0:
-            done = self.state.bytes_downloaded
+            done = min(self.state.bytes_downloaded, self.info.total_bytes)
             total = self.info.total_bytes
             pct = min(100.0, done / total * 100)
             self.progress.configure(value=pct)
